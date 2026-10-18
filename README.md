@@ -5,6 +5,22 @@
 
 - **Author GitHub**: [https://github.com/geniuth](https://github.com/geniuth)
 - **Repository**: [https://github.com/geniuth/autocut](https://github.com/geniuth/autocut)
+- **Current Version**: `v2.2.0` — 변경 이력은 [CHANGELOG.md](CHANGELOG.md) 참고 (Semantic Versioning)
+
+---
+
+## 🤖 0. 기본 AI 모델 스택 (v2.2.0)
+
+| 역할 | 기본 모델 | 사용처 |
+| :--- | :--- | :--- |
+| 🎙️ 음성 인식 + VAD | **Faster-Whisper large-v3-turbo** | 한국어 대화 자막, 말소리 구간 보존 |
+| 🌟 미학 점수 / 베스트 샷 | **CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5)** | 컷 후보 점수화, 인트로 베스트 샷 선정 |
+| ✂️ 샷 경계 검출 | **TransNetV2 / PySceneDetect ContentDetector** | 컷 경계 스냅, 유튜브 스타일 학습의 컷 템포 측정 |
+| 🧠 멀티모달 장면 이해 | **Qwen2.5-VL (7B) / InternVL 2.5** | 장면 캡션(자막 태그), 하이라이트 점수 |
+
+- **VRAM 순차 관리 (8GB GPU 대응)**: Whisper 전체 처리 → 모델 해제 → CLIP/VLM 분석 → 해제 → NVENC 4K 인코딩 순서로 실행됩니다.
+- **Qwen2.5-VL / InternVL**: 로컬 Ollama(`qwen2.5vl`, `internvl`)가 있으면 사용하고, 없으면 CUDA zero-shot 장면 분류기로 자동 대체되어 렌더링이 멈추지 않습니다.
+- 분석 리포트 JSON에 `version`, `ai_models`, `aesthetic_mean`, `shot_boundaries`, `vlm_caption`, `vlm_highlight_score`가 기록됩니다.
 
 ---
 

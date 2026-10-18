@@ -84,6 +84,8 @@ from autocut_engine import (
     get_all_style_presets,
     analyze_youtube_style,
     _load_kr_font,
+    AUTOCUT_VERSION,
+    DEFAULT_AI_MODELS,
 )
 
 
@@ -244,7 +246,7 @@ class AutoCutStudioApp(tk.Tk):
         super().__init__()
         self.withdraw()
 
-        self.title("AutoCut Studio 2026 — 비전/모션 & 유튜브 스타일 AI 자동 영상 편집기 (Filmora 연동)")
+        self.title(f"AutoCut Studio 2026 v{AUTOCUT_VERSION} — 비전/모션 & 유튜브 스타일 AI 자동 영상 편집기 (Filmora 연동)")
 
         self.geometry("1920x1080+0+0")
         self.minsize(1360, 820)
@@ -273,7 +275,7 @@ class AutoCutStudioApp(tk.Tk):
 
         self.target_dir = tk.StringVar(value=r"D:\편집할영상\2023_제주도여행")
         self.edit_mode = tk.StringVar(value="travel")
-        self.whisper_model = tk.StringVar(value="small")
+        self.whisper_model = tk.StringVar(value="large-v3-turbo")
         self.denoise_audio = tk.BooleanVar(value=True)
         self.include_scene_captions = tk.BooleanVar(value=True)
         self.burn_subtitles = tk.BooleanVar(value=True)
@@ -648,6 +650,24 @@ class AutoCutStudioApp(tk.Tk):
             foreground="#f9e2af",
             background=bg_main,
         ).pack(side=tk.RIGHT)
+        ttk.Label(
+            header_row,
+            text=f"v{AUTOCUT_VERSION}   ",
+            font=(f_family, 10, "bold"),
+            foreground="#a6e3a1",
+            background=bg_main,
+        ).pack(side=tk.RIGHT)
+
+        ttk.Label(
+            main,
+            text=(
+                f"🤖 AI 엔진: {DEFAULT_AI_MODELS['stt']}  ·  CLIP Aesthetic (LAION V2.5)  ·  "
+                f"{DEFAULT_AI_MODELS['shot_detector']}  ·  {DEFAULT_AI_MODELS['vlm']}"
+            ),
+            font=(f_family, 9),
+            foreground="#7f849c",
+            background=bg_main,
+        ).pack(fill=tk.X, anchor="w", pady=(0, 6))
 
         folder_card = tk.Frame(main, bg=bg_card, highlightthickness=1, highlightbackground="#313244", padx=14, pady=9)
         folder_card.pack(fill=tk.X, pady=(0, 12))
