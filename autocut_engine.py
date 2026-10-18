@@ -375,9 +375,14 @@ def detect_dji_or_dlog_clip(filepath: str) -> Tuple[bool, str]:
     return False, "none"
 
 
-def get_color_profile_filter(color_profile_key_or_id: str, filepath: str = "") -> Tuple[str, str]:
+def get_color_profile_filter(
+    color_profile_key_or_id: str,
+    filepath: str = "",
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> str:
     """
-    Return (ffmpeg_vf_string, applied_label) for the selected color profile preset.
+    Return the FFmpeg video filter string (str) for the selected color profile preset.
+    Logs a message via log_fn when DJI D-Log / D-Log M is auto-detected.
     """
     cfg = COLOR_PROFILE_PRESETS.get(color_profile_key_or_id)
     if cfg is None:
@@ -395,9 +400,13 @@ def get_color_profile_filter(color_profile_key_or_id: str, filepath: str = "") -
             if is_dlog and det_id in ("dji_dlog", "dji_dlog_m"):
                 for k, v in COLOR_PROFILE_PRESETS.items():
                     if v["id"] == det_id:
-                        return v["vf"], f"자동 감지 ({det_id.upper()})"
-        return "", ""
-    return cfg.get("vf", ""), cid
+                        if log_fn:
+                            log_fn(
+                                f"  🚁 [{os.path.basename(filepath)}] DJI {det_id.upper()} 평면 프로파일 감지 -> Rec.709 색감 자동 복원 적용"
+                            )
+                        return str(v.get("vf", "")).strip()
+        return ""
+    return str(cfg.get("vf", "")).strip()
 
 
 
