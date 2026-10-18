@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.tmp
+*.bak
+assets/*.wav
+output/
+test_full_jeju.py
+test_one_day.py
+run_classification.py

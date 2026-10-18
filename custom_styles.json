@@ -1,0 +1,31 @@
+{
+  "🎯 [유튜브 학습] 대구에서도 귀여운짓 26개월만5세와 막창 부추잡": {
+    "id": "yt_1792248106",
+    "source_url": "https://youtu.be/jxqq9VGnCbs",
+    "avg_cut_sec": 8.8,
+    "max_silent_sec": 8.0,
+    "speech_pad_sec": 0.65,
+    "max_sub_chars": 26,
+    "sub_font_size": 50,
+    "transition_prob": 0.75,
+    "transitions": [
+      "fade",
+      "smoothleft",
+      "smoothright",
+      "smoothup",
+      "smoothdown",
+      "circleopen",
+      "circleclose",
+      "wipeleft",
+      "wiperight",
+      "slideleft",
+      "slideright",
+      "dissolve",
+      "diagtl",
+      "diagbr",
+      "radial"
+    ],
+    "eq_filter": "eq=saturation=1.02:contrast=1.0,colorbalance=rs=0.06:bs=-0.06",
+    "desc": "여유로운 감성 호흡(평균 컷 8.8초) · 채도 x1.02 / 대비 x1.0 / 색온도 +0.06 · 자막 26자"
+  }
+}
