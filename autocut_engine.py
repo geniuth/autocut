@@ -58,7 +58,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "2.5.0"
+AUTOCUT_VERSION = "2.6.0"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -3047,6 +3047,118 @@ def _join_cut(
     return (trans if use_v else "none"), (td if use_v else 0.0), (ax if use_a else 0.0)
 
 
+def _speech_overlap(clip: Dict, s: float, e: float) -> Tuple[float, Optional[Tuple[float, float]]]:
+    """(seconds of speech inside [s, e], (first speech start, last speech end) clipped to it or None)."""
+    total, lo, hi = 0.0, None, None
+    for sp in clip.get("speech") or []:
+        a, b = max(s, float(sp.get("start", 0))), min(e, float(sp.get("end", 0)))
+        if b > a:
+            total += b - a
+            lo = a if lo is None else min(lo, a)
+            hi = b if hi is None else max(hi, b)
+    return total, ((lo, hi) if lo is not None else None)
+
+
+def enforce_edit_length_budget(
+    clips_meta: List[Dict], max_ratio: float, log_fn: Callable[[str], None] = print
+) -> Tuple[float, float]:
+    """
+    Keep the edited video length at or below max_ratio x the total original video length (photos are
+    3-second slides and not counted). Trims in order of least loss:
+      1) shorten silent (no-speech) intervals to 2.5 s, lowest-scoring first
+      2) trim silent margins around speech to 0.4 s
+      3) drop each clip's extra intervals (keeping its best one), lowest-scoring first
+      4) drop whole clips, lowest-scoring first (silent ones before ones with speech)
+    Scores: speech share x3 + aesthetic/10 + VLM highlight/10. Mutates kept_intervals / kept_duration.
+    Returns (original video seconds, kept video seconds).
+    """
+    videos = [c for c in clips_meta if c.get("type", "video") == "video"]
+    total = sum(float(c.get("duration", 0.0) or 0.0) for c in videos)
+
+    def kept() -> float:
+        return sum(e - s for c in videos for s, e in c.get("kept_intervals", []))
+
+    before = kept()
+    if not max_ratio or max_ratio >= 1.0 or total <= 0 or before <= total * max_ratio:
+        if max_ratio and max_ratio < 1.0 and total > 0:
+            log_fn(f"📏 편집 길이 {before / 60:.1f}분 = 원본 영상 {total / 60:.1f}분의 {before / total * 100:.0f}% (상한 {max_ratio * 100:.0f}% 이내)")
+        return total, before
+    budget = total * max_ratio
+
+    def score(c: Dict, s: float, e: float) -> float:
+        sp, _ = _speech_overlap(c, s, e)
+        return 3.0 * sp / max(0.1, e - s) + float(c.get("aesthetic_mean", 5.0) or 5.0) / 10.0 + float(
+            c.get("vlm_highlight_score", 5.0) or 5.0
+        ) / 10.0
+
+    def intervals():
+        return [(c, k) for c in videos for k in range(len(c.get("kept_intervals", [])))]
+
+    def excess() -> float:
+        return kept() - budget
+
+    # 1) shorten silent intervals around their middle
+    for c, k in sorted(intervals(), key=lambda ck: score(ck[0], *ck[0]["kept_intervals"][ck[1]])):
+        if excess() <= 0:
+            break
+        s, e = c["kept_intervals"][k]
+        if _speech_overlap(c, s, e)[0] > 0 or e - s <= 2.5:
+            continue
+        new_d = max(2.5, (e - s) - excess())
+        mid = (s + e) / 2
+        c["kept_intervals"][k] = [round(mid - new_d / 2, 2), round(mid + new_d / 2, 2)]
+
+    # 2) trim silent margins of speech intervals
+    for c, k in sorted(intervals(), key=lambda ck: score(ck[0], *ck[0]["kept_intervals"][ck[1]])):
+        if excess() <= 0:
+            break
+        s, e = c["kept_intervals"][k]
+        _, span = _speech_overlap(c, s, e)
+        if not span:
+            continue
+        ns, ne = max(s, span[0] - 0.4), min(e, span[1] + 0.4)
+        spare = (ns - s) + (e - ne)
+        if spare <= 0:
+            continue
+        f = min(1.0, excess() / spare)  # trim only as much as needed, evenly from both sides
+        c["kept_intervals"][k] = [round(s + (ns - s) * f, 2), round(e - (e - ne) * f, 2)]
+
+    # 3) drop extra intervals, keeping each clip's best one
+    extras = []
+    for c in videos:
+        ivs = c.get("kept_intervals", [])
+        if len(ivs) > 1:
+            best = max(range(len(ivs)), key=lambda k: score(c, *ivs[k]))
+            extras += [(score(c, *iv), k, c, iv) for k, iv in enumerate(ivs) if k != best]
+    for _, _, c, iv in sorted(extras, key=lambda x: (x[0], x[1])):
+        if excess() <= 0:
+            break
+        c["kept_intervals"] = [x for x in c["kept_intervals"] if x is not iv]
+
+    # 4) drop whole clips, silent and low-scoring first
+    def clip_rank(c: Dict):
+        ivs = c.get("kept_intervals", [])
+        has_speech = any(_speech_overlap(c, s, e)[0] > 0 for s, e in ivs)
+        return (has_speech, max((score(c, s, e) for s, e in ivs), default=0.0))
+
+    dropped = 0
+    for c in sorted([c for c in videos if c.get("kept_intervals")], key=clip_rank):
+        if excess() <= 0:
+            break
+        c["kept_intervals"] = []
+        dropped += 1
+
+    for c in videos:
+        c["kept_duration"] = round(sum(e - s for s, e in c.get("kept_intervals", [])), 2)
+    after = kept()
+    log_fn(
+        f"📏 편집 길이 상한 {max_ratio * 100:.0f}% 적용: 원본 영상 {total / 60:.1f}분 중 {before / 60:.1f}분({before / total * 100:.0f}%) -> "
+        f"{after / 60:.1f}분({after / total * 100:.0f}%)"
+        + (f" · 우선순위 낮은 클립 {dropped}개 제외" if dropped else "")
+    )
+    return total, after
+
+
 def apply_manual_clip_order(clips_meta: List[Dict], manual_order: Optional[List[str]]) -> List[Dict]:
     """
     Reorder clips to the user's timeline order (list of file paths). Clips missing from the list
@@ -3099,6 +3211,7 @@ def run_autocut_pipeline(
     video_codec: str = "hevc_nvenc",
     manual_order: Optional[List[str]] = None,
     clip_rotations: Optional[Dict[str, int]] = None,
+    max_edit_ratio: float = 0.6,
     log_fn: Callable[[str], None] = print,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     stop_check_fn: Optional[Callable[[], bool]] = None,
@@ -3107,6 +3220,7 @@ def run_autocut_pipeline(
     End-to-end AutoCut Studio 2026 pipeline with SOTA AI Models as Default.
     manual_order: file paths in the order arranged on the GUI timeline (None = shooting-time order).
     clip_rotations: {file path: clockwise degrees (90/180/270)} set by hand on the timeline.
+    max_edit_ratio: edited video length cap as a share of the original video length (0.6 = 60%; >= 1 = no cap).
     Models:
       1) Faster-Whisper large-v3-turbo (Speech & VAD)
       2) CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5)
@@ -3401,6 +3515,14 @@ def run_autocut_pipeline(
             c["rotation"] = rot_map.get(os.path.normcase(os.path.abspath(c.get("path", ""))), 0)
             if c["rotation"]:
                 log_fn(f"  ↻ [{c.get('file', '')}] 수동 회전 {c['rotation']}° 적용")
+
+        # Length cap (on in-memory intervals only: the saved analysis report keeps the full selection,
+        # so changing the cap later re-trims from the original analysis instead of from a trimmed one)
+        _, kept_video_sec = enforce_edit_length_budget(clips_meta, max_edit_ratio, log_fn=log_fn)
+        n_photo_cuts = sum(1 for c in clips_meta if c.get("type") == "photo")
+        total_edit_sec = kept_video_sec + 3.0 * n_photo_cuts
+        analysis_summary["total_edited_seconds"] = round(total_edit_sec, 2)
+        analysis_summary["max_edit_ratio"] = max_edit_ratio
 
         if manual_order:
             clips_meta = apply_manual_clip_order(clips_meta, manual_order)

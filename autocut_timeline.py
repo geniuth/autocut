@@ -138,7 +138,9 @@ class TimelinePanel(tk.Frame):
         self.items: List[Dict] = []
         self.offsets: Dict[str, float] = {}
         self.dev_colors: Dict[str, str] = {}
-        self.sel = -1
+        self.sel = -1  # focused clip (keyboard / last clicked)
+        self.sel_paths: set = set()  # every selected clip (Ctrl / Shift + click), moved and rotated together
+        self._anchor = -1  # Shift+click range anchor
         self._gen = 0
         self._xs: List[Tuple[int, int]] = []
         self._tk_thumbs: Dict[str, ImageTk.PhotoImage] = {}
@@ -167,7 +169,7 @@ class TimelinePanel(tk.Frame):
         body.pack(fill=tk.X)
         tk.Label(
             body,
-            text="V1\n🎬📷\n\n드래그\n우클릭\nR 회전",
+            text="V1\n🎬📷\n\nCtrl/Shift\n다중선택\nR 회전",
             bg="#1e1e2e",
             fg="#b4befe",
             font=(font_family, 8, "bold"),
@@ -184,9 +186,32 @@ class TimelinePanel(tk.Frame):
             xscrollincrement=self._px(30),
         )
         self.canvas.pack(fill=tk.X)
-        hs = ttk.Scrollbar(cwrap, orient=tk.HORIZONTAL, command=self.canvas.xview)
-        hs.pack(fill=tk.X)
-        self.canvas.configure(xscrollcommand=hs.set)
+
+        # Scroll bar: thick, bright thumb on a near-black trough + a "which clips am I looking at" readout
+        st = ttk.Style(self)
+        st.configure(
+            "Timeline.Horizontal.TScrollbar",
+            troughcolor="#0b0b12",
+            background="#89b4fa",
+            lightcolor="#b4befe",
+            darkcolor="#5b7fd6",
+            bordercolor="#585b70",
+            arrowcolor="#11111b",
+            arrowsize=self._px(15),
+            gripcount=0,
+        )
+        st.map(
+            "Timeline.Horizontal.TScrollbar",
+            background=[("pressed", "#f9e2af"), ("active", "#b4befe")],
+            arrowcolor=[("disabled", "#45475a")],
+        )
+        srow = tk.Frame(cwrap, bg=bg)
+        srow.pack(fill=tk.X, pady=(self._px(2), 0))
+        self.range_lbl = tk.Label(srow, text="", bg="#11111b", fg="#f9e2af", font=(font_family, 9, "bold"), padx=8)
+        self.range_lbl.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+        self.hscroll = ttk.Scrollbar(srow, orient=tk.HORIZONTAL, command=self.canvas.xview, style="Timeline.Horizontal.TScrollbar")
+        self.hscroll.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.canvas.configure(xscrollcommand=self._on_xscroll)
 
         c = self.canvas
         c.bind("<ButtonPress-1>", self._on_press)
@@ -197,6 +222,10 @@ class TimelinePanel(tk.Frame):
         c.bind("<MouseWheel>", lambda e: c.xview_scroll(int(-e.delta / 120) * 2, "units"))
         c.bind("<Left>", lambda e: self._select(self.sel - 1))
         c.bind("<Right>", lambda e: self._select(self.sel + 1))
+        c.bind("<Shift-Left>", lambda e: self._select(self.sel - 1, extend=True))
+        c.bind("<Shift-Right>", lambda e: self._select(self.sel + 1, extend=True))
+        c.bind("<Control-a>", lambda e: self.select_all())
+        c.bind("<Escape>", lambda e: self._select(self.sel))
         c.bind("<Control-Left>", lambda e: self.move_selected(-1))
         c.bind("<Control-Right>", lambda e: self.move_selected(+1))
         c.bind("<r>", lambda e: self.rotate_selected(90))
@@ -257,6 +286,8 @@ class TimelinePanel(tk.Frame):
         else:
             self.items = sorted(metas, key=lambda x: (x["eff_time"], x["file"]))
         self.sel = 0 if self.items else -1
+        self._anchor = self.sel
+        self.sel_paths = {self.items[0]["path"]} if self.items else set()
         self._update_info()
         self._update_state_label()
         self._schedule_redraw()
@@ -298,13 +329,19 @@ class TimelinePanel(tk.Frame):
         self._tk_thumbs[path] = ImageTk.PhotoImage(tile)
 
     def rotate_selected(self, delta: int):
-        """Rotate the selected clip clockwise by delta degrees (±90 / 180); 0 resets it."""
-        if not (0 <= self.sel < len(self.items)):
+        """Rotate every selected clip clockwise by delta degrees (±90 / 180); 0 resets them."""
+        targets = [it for it in self.items if it["path"] in self.sel_paths]
+        if not targets:
             return
-        it = self.items[self.sel]
-        it["rotation"] = 0 if delta == 0 else (it.get("rotation", 0) + delta) % 360
-        self._build_tile(it["path"])
-        self._commit(f"↻ 클립 회전: '{it['file']}' -> {it['rotation']}°" if it["rotation"] else f"↻ 클립 회전 해제: '{it['file']}'")
+        for it in targets:
+            it["rotation"] = 0 if delta == 0 else (it.get("rotation", 0) + delta) % 360
+            self._build_tile(it["path"])
+        if len(targets) == 1:
+            it = targets[0]
+            msg = f"↻ 클립 회전: '{it['file']}' -> {it['rotation']}°" if it["rotation"] else f"↻ 클립 회전 해제: '{it['file']}'"
+        else:
+            msg = f"↻ 선택한 {len(targets)}개 클립 " + (f"{delta:+d}° 회전" if delta else "회전 해제")
+        self._commit(msg)
 
     # ── Time correction & ordering ───────────────────────────────────────────
     def _recompute_times(self, items: List[Dict]):
@@ -356,6 +393,8 @@ class TimelinePanel(tk.Frame):
     def _update_state_label(self):
         n_rot = len(self._rotations()) if self.items else 0
         rot_txt = f" · 회전 {n_rot}개" if n_rot else ""
+        n_sel = len(self.sel_paths)
+        rot_txt += f" · 선택 {n_sel}개" if n_sel > 1 else ""
         if not self.items:
             self.state_lbl.configure(text="")
         elif self._is_default_order():
@@ -400,23 +439,43 @@ class TimelinePanel(tk.Frame):
     def reset_to_time_order(self):
         if not self.items:
             return
+        focus = self.items[self.sel]["path"] if 0 <= self.sel < len(self.items) else None
         self.items.sort(key=lambda x: (x["eff_time"], x["file"]))
-        self.sel = min(max(self.sel, 0), len(self.items) - 1)
+        self.sel = next((i for i, it in enumerate(self.items) if it["path"] == focus), 0)
         self._commit("⟲ 타임라인을 촬영 시각순(기기 시간 보정 반영)으로 다시 정렬했습니다.")
 
-    def move_selected(self, delta: int):
-        i = self.sel
-        j = i + delta
-        if not (0 <= i < len(self.items)) or not (0 <= j < len(self.items)):
-            return
-        self._move(i, j)
+    def _selected_indices(self) -> List[int]:
+        return [i for i, it in enumerate(self.items) if it["path"] in self.sel_paths]
 
-    def _move(self, i: int, j: int):
-        it = self.items.pop(i)
-        self.items.insert(j, it)
-        self.sel = j
-        self._commit(f"🧲 타임라인 순서 변경: '{it['file']}' -> {j + 1}번째")
-        self._ensure_visible(j)
+    def move_selected(self, delta: int):
+        """Move the selection one slot left/right (a scattered selection is gathered into one block)."""
+        idx = self._selected_indices()
+        if idx:
+            self._move_block(idx[0] + delta)
+
+    def _move_block(self, target: int):
+        """Place the selected clips, in their current order, starting at `target` among the unselected clips."""
+        block = [it for it in self.items if it["path"] in self.sel_paths]
+        if not block:
+            return
+        rest = [it for it in self.items if it["path"] not in self.sel_paths]
+        target = max(0, min(target, len(rest)))
+        new = rest[:target] + block + rest[target:]
+        if [i["path"] for i in new] == [i["path"] for i in self.items]:
+            return
+        focus = self.items[self.sel]["path"] if 0 <= self.sel < len(self.items) else block[0]["path"]
+        self.items = new
+        self.sel = next(i for i, it in enumerate(self.items) if it["path"] == focus)
+        self._anchor = self.sel
+        what = f"'{block[0]['file']}'" if len(block) == 1 else f"선택한 {len(block)}개 클립"
+        self._commit(f"🧲 타임라인 순서 변경: {what} -> {target + 1}번째" + ("부터" if len(block) > 1 else ""))
+        self._ensure_visible(target)
+
+    def select_all(self):
+        self.sel_paths = {it["path"] for it in self.items}
+        self._update_state_label()
+        self._schedule_redraw()
+        return "break"
 
     def _set_device_offset(self, dev_key: str, seconds: float, msg: str):
         if abs(seconds) < 0.5:
@@ -490,7 +549,8 @@ class TimelinePanel(tk.Frame):
             x0, x1 = x, x + w
             self._xs.append((x0, x1))
             col = self.dev_colors.get(it["dev_key"], "#89b4fa")
-            selected = i == self.sel
+            selected = it["path"] in self.sel_paths
+            focused = i == self.sel
 
             # Ruler: tick per clip, date label when the day changes
             day = it["eff_time"][:10]
@@ -501,11 +561,13 @@ class TimelinePanel(tk.Frame):
 
             c.create_rectangle(
                 x0, y0, x1, y1,
-                fill=_mix(col, "#14141f", 0.78),
+                fill=_mix("#f9e2af", "#14141f", 0.72) if selected else _mix(col, "#14141f", 0.78),
                 outline="#f9e2af" if selected else _mix(col, "#14141f", 0.35),
                 width=P(2) if selected else 1,
             )
             c.create_rectangle(x0 + 1, y0 + 1, x1 - 1, y0 + P(3), fill=col, outline="")
+            if focused:
+                c.create_rectangle(x0 + P(2), y1 - P(3), x1 - P(2), y1 - P(1), fill="#f9e2af", outline="")
 
             tx = x0 + (w - self.THUMB_W) // 2
             ty = y0 + P(5)
@@ -552,6 +614,22 @@ class TimelinePanel(tk.Frame):
             )
             x = x1 + self.GAP
         c.configure(scrollregion=(0, 0, x + P(4), self.CANVAS_H))
+        self._update_range_label()
+
+    def _on_xscroll(self, first, last):
+        self.hscroll.set(first, last)
+        self._update_range_label()
+
+    def _update_range_label(self):
+        """'보는 중 5–12 / 23' — which clips are on screen, so the scroll position is obvious."""
+        if not self.items or not self._xs:
+            self.range_lbl.configure(text="")
+            return
+        left = self.canvas.canvasx(0)
+        right = left + self.canvas.winfo_width()
+        vis = [i for i, (x0, x1) in enumerate(self._xs) if x1 > left + 2 and x0 < right - 2]
+        if vis:
+            self.range_lbl.configure(text=f"◀ 보는 중 {vis[0] + 1}–{vis[-1] + 1} / {len(self.items)} ▶")
 
     def _ensure_visible(self, i: int):
         if not (0 <= i < len(self._xs)):
@@ -579,19 +657,49 @@ class TimelinePanel(tk.Frame):
                 return i
         return len(self._xs)
 
-    def _select(self, i: int):
-        if 0 <= i < len(self.items):
-            self.sel = i
-            self._schedule_redraw()
-            self._ensure_visible(i)
+    def _select(self, i: int, extend: bool = False):
+        """Focus clip i; with extend (Shift+arrow) grow the selection from the anchor, else select only it."""
+        if not (0 <= i < len(self.items)):
+            return
+        self.sel = i
+        if extend and 0 <= self._anchor < len(self.items):
+            lo, hi = sorted((self._anchor, i))
+            self.sel_paths = {self.items[k]["path"] for k in range(lo, hi + 1)}
+        else:
+            self._anchor = i
+            self.sel_paths = {self.items[i]["path"]}
+        self._update_state_label()
+        self._schedule_redraw()
+        self._ensure_visible(i)
 
     def _on_press(self, e):
         self.canvas.focus_set()
         i = self._index_at(self.canvas.canvasx(e.x))
-        self._drag = {"idx": i, "x": e.x, "active": False} if i >= 0 else None
-        if i >= 0:
+        self._drag = None
+        if i < 0:
+            return
+        path = self.items[i]["path"]
+        ctrl, shift = bool(e.state & 0x0004), bool(e.state & 0x0001)
+        if shift and 0 <= self._anchor < len(self.items):
+            lo, hi = sorted((self._anchor, i))
+            rng = {self.items[k]["path"] for k in range(lo, hi + 1)}
+            self.sel_paths = (self.sel_paths | rng) if ctrl else rng
             self.sel = i
-            self._schedule_redraw()
+        elif ctrl:
+            self.sel_paths ^= {path}
+            if not self.sel_paths:
+                self.sel_paths = {path}
+            self.sel, self._anchor = i, i
+        else:
+            # Pressing on a clip that is already part of a multi-selection keeps the group so it can be
+            # dragged together; a plain click without dragging collapses to that one clip on release.
+            collapse = path in self.sel_paths and len(self.sel_paths) > 1
+            if not collapse:
+                self.sel_paths = {path}
+            self.sel, self._anchor = i, i
+            self._drag = {"idx": i, "x": e.x, "active": False, "collapse": collapse}
+        self._update_state_label()
+        self._schedule_redraw()
 
     def _on_motion(self, e):
         d = self._drag
@@ -611,23 +719,29 @@ class TimelinePanel(tk.Frame):
         c.delete("dnd")
         gx = (self._xs[g][0] - self.GAP / 2) if g < len(self._xs) else (self._xs[-1][1] + self.GAP / 2)
         c.create_line(gx, 2, gx, self.CANVAS_H - 2, fill="#f9e2af", width=self._px(2.5), tags="dnd")
-        w = self._clip_w(self.items[d["idx"]])
+        n = len(self.sel_paths)
+        w = self._clip_w(self.items[d["idx"]]) + (self._px(10) if n > 1 else 0)
         c.create_rectangle(
             cx - w / 2, self.CLIP_Y + self._px(4), cx + w / 2, self.CLIP_Y + self.CLIP_H - self._px(4),
             outline="#f9e2af", dash=(4, 3), width=self._px(1.5), tags="dnd",
         )
+        if n > 1:
+            c.create_text(cx, self.CLIP_Y + self.CLIP_H / 2, text=f"{n}개 이동", fill="#f9e2af", font=(self.ff, 10, "bold"), tags="dnd")
         d["gap"] = g
 
     def _on_release(self, e):
         d, self._drag = self._drag, None
         self.canvas.delete("dnd")
-        if not d or not d["active"] or "gap" not in d:
+        if not d:
             return
-        i, g = d["idx"], d["gap"]
-        if g > i:
-            g -= 1
-        if g != i:
-            self._move(i, g)
+        if not d["active"] or "gap" not in d:
+            if d.get("collapse"):
+                self._select(d["idx"])
+            return
+        # Drop position counted among the clips that are NOT being moved
+        g = d["gap"]
+        target = sum(1 for k in range(min(g, len(self.items))) if self.items[k]["path"] not in self.sel_paths)
+        self._move_block(target)
 
     def _on_double(self, e):
         i = self._index_at(self.canvas.canvasx(e.x))
@@ -641,26 +755,29 @@ class TimelinePanel(tk.Frame):
         i = self._index_at(self.canvas.canvasx(e.x))
         if i < 0:
             return
-        self.sel = i
-        self._schedule_redraw()
         it = self.items[i]
+        if it["path"] not in self.sel_paths:
+            self._select(i)
+        else:
+            self.sel = i
+            self._schedule_redraw()
         dev = it["device"]
         key = it["dev_key"]
         cur_off = self.offsets.get(key, 0.0)
+        n = len(self.sel_paths)
+        what = "선택한 클립" if n == 1 else f"선택한 {n}개"
         m = tk.Menu(self, tearoff=0, font=(self.ff, 10))
         m.add_command(label=f"▶ 재생 / 열기: {it['file']}", command=lambda: self._on_double(e))
         m.add_separator()
-        m.add_command(label="⏮ 맨 앞으로 이동", command=lambda: self._move(i, 0) if i != 0 else None)
-        m.add_command(
-            label="⏭ 맨 뒤로 이동",
-            command=lambda: self._move(i, len(self.items) - 1) if i != len(self.items) - 1 else None,
-        )
+        m.add_command(label=f"⏮ {what} 맨 앞으로 이동", command=lambda: self._move_block(0))
+        m.add_command(label=f"⏭ {what} 맨 뒤로 이동", command=lambda: self._move_block(len(self.items)))
+        m.add_command(label="☑ 전체 선택 (Ctrl+A)", command=self.select_all)
         m.add_separator()
-        m.add_command(label="↻ 시계방향 90° 회전 (R)", command=lambda: self.rotate_selected(90))
-        m.add_command(label="↺ 반시계방향 90° 회전 (Shift+R)", command=lambda: self.rotate_selected(-90))
-        m.add_command(label="⟳ 180° 회전 (거꾸로 찍힌 영상)", command=lambda: self.rotate_selected(180))
-        if it.get("rotation"):
-            m.add_command(label=f"회전 초기화 (현재 {it['rotation']}°)", command=lambda: self.rotate_selected(0))
+        m.add_command(label=f"↻ {what} 시계방향 90° 회전 (R)", command=lambda: self.rotate_selected(90))
+        m.add_command(label=f"↺ {what} 반시계방향 90° 회전 (Shift+R)", command=lambda: self.rotate_selected(-90))
+        m.add_command(label=f"⟳ {what} 180° 회전 (거꾸로 찍힌 영상)", command=lambda: self.rotate_selected(180))
+        if any(x.get("rotation") for x in self.items if x["path"] in self.sel_paths):
+            m.add_command(label=f"{what} 회전 초기화", command=lambda: self.rotate_selected(0))
         m.add_separator()
         m.add_command(label=f"🕒 '{dev}' 시간 보정 — 이 클립의 실제 촬영 시각 입력...", command=lambda: self._ask_device_time(i))
         m.add_command(

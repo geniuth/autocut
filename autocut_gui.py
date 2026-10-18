@@ -99,6 +99,17 @@ from autocut_timeline import (
 
 SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "autocut_session.json")
 PROJECT_FILE_EXT = ".autocut.json"
+APP_ICON_ICO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "autocut_icon.ico")
+APP_ICON_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "autocut_icon.png")
+EDIT_RATIO_CHOICES = ["60% (기본)", "50%", "40%", "70%", "80%", "제한 없음"]
+
+
+def _parse_edit_ratio(label: str) -> float:
+    """'60% (기본)' -> 0.6, '제한 없음' -> 1.0."""
+    try:
+        return max(0.1, min(1.0, int(label.split("%")[0].strip()) / 100.0))
+    except (ValueError, IndexError):
+        return 1.0
 
 
 class _FILETIME(ctypes.Structure):
@@ -467,9 +478,12 @@ def create_premiere_splash_image(width: int = 820, height: int = 460) -> Image.I
     draw.rounded_rectangle([8, 8, width - 9, height - 9], radius=12, outline=(88, 91, 112, 180), width=1)
 
     bx, by, bs = 54, 48, 92
-    draw.rounded_rectangle([bx, by, bx + bs, by + bs], radius=20, fill=(30, 22, 68, 255), outline=(203, 166, 247, 255), width=4)
-    font_badge = _load_kr_font(44, bold=True)
-    draw.text((bx + 17, by + 16), "Ac", font=font_badge, fill=(216, 180, 254, 255))
+    if os.path.exists(APP_ICON_PNG):
+        icon = Image.open(APP_ICON_PNG).convert("RGBA").resize((bs, bs), Image.Resampling.LANCZOS)
+        img.alpha_composite(icon, (bx, by))
+    else:
+        draw.rounded_rectangle([bx, by, bx + bs, by + bs], radius=20, fill=(30, 22, 68, 255), outline=(203, 166, 247, 255), width=4)
+        draw.text((bx + 17, by + 16), "Ac", font=_load_kr_font(44, bold=True), fill=(216, 180, 254, 255))
 
     font_brand = _load_kr_font(38, bold=True)
     font_sub = _load_kr_font(16, bold=True)
@@ -494,6 +508,15 @@ class AutoCutStudioApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.withdraw()
+        # Cinema-camera app icon: .ico for the title bar / taskbar (all sizes), PNG for Tk's own windows
+        try:
+            if os.path.exists(APP_ICON_ICO):
+                self.iconbitmap(default=APP_ICON_ICO)
+            if os.path.exists(APP_ICON_PNG):
+                self._app_icon = tk.PhotoImage(file=APP_ICON_PNG)
+                self.iconphoto(True, self._app_icon)
+        except Exception:
+            pass
 
         self.title(f"AutoCut Studio 2026 v{AUTOCUT_VERSION} — 비전/모션 & 유튜브 스타일 AI 자동 영상 편집기 (Filmora 연동)")
 
@@ -548,6 +571,7 @@ class AutoCutStudioApp(tk.Tk):
         self.out_bitrate_bps_var = tk.StringVar(value="25,000,000")
         self.out_codec_var = tk.StringVar(value="HEVC (H.265 - hevc_nvenc 권장)")
         self.color_profile_var = tk.StringVar(value=next(iter(COLOR_PROFILE_PRESETS.keys())))
+        self.max_edit_ratio_var = tk.StringVar(value=EDIT_RATIO_CHOICES[0])
 
         # YouTube Style Analyzer & Preset variables
         self.all_presets = get_all_style_presets()
@@ -837,6 +861,7 @@ class AutoCutStudioApp(tk.Tk):
             "out_bitrate_bps": self.out_bitrate_bps_var,
             "out_codec": self.out_codec_var,
             "color_profile": self.color_profile_var,
+            "max_edit_ratio": self.max_edit_ratio_var,
             "style_preset": self.style_preset_var,
             "yt_url": self.yt_url_var,
         }
@@ -881,6 +906,7 @@ class AutoCutStudioApp(tk.Tk):
         valid_choices = {
             "intro_style": set(INTRO_STYLE_PRESETS),
             "color_profile": set(COLOR_PROFILE_PRESETS),
+            "max_edit_ratio": set(EDIT_RATIO_CHOICES),
             "style_preset": set(self.all_presets),
         }
         for key, var in self._state_vars().items():
@@ -1354,6 +1380,23 @@ class AutoCutStudioApp(tk.Tk):
             font=(f_family, 10),
         )
         self.dlog_combo.grid(row=4, column=1, sticky="ew", pady=4)
+
+        ttk.Label(enc_grid, text="편집 길이 상한", style="FormLabel.TLabel").grid(
+            row=5, column=0, sticky="w", padx=(0, 14), pady=4
+        )
+        ratio_row = ttk.Frame(enc_grid, style="Card.TFrame")
+        ratio_row.grid(row=5, column=1, sticky="ew", pady=4)
+        ttk.Combobox(
+            ratio_row,
+            textvariable=self.max_edit_ratio_var,
+            values=EDIT_RATIO_CHOICES,
+            state="readonly",
+            font=(f_family, 10),
+            width=12,
+        ).pack(side=tk.LEFT)
+        ttk.Label(ratio_row, text=" 원본 영상 대비 (초과 시 무음부터 줄임)", style="Desc.TLabel").pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
 
         tk.Frame(col3, bg="#313244", height=1).pack(fill=tk.X, pady=(4, 8))
 
@@ -1947,6 +1990,7 @@ class AutoCutStudioApp(tk.Tk):
                     video_codec=v_codec,
                     manual_order=manual_order,
                     clip_rotations=clip_rotations,
+                    max_edit_ratio=_parse_edit_ratio(self.max_edit_ratio_var.get()),
                     log_fn=lambda m: self.after(0, self.log, m),
                     progress_fn=lambda p, s: self.after(0, self.update_progress, p, s),
                     stop_check_fn=lambda: self._stop_requested,

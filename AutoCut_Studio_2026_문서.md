@@ -13,6 +13,7 @@
 | [`autocut_engine.py`](file:///d:/workspace/autocut/autocut_engine.py) | **핵심 AI 편집 엔진** (날짜별 분류, 메타데이터 시간순 정렬, OpenCV 비전/모션 스코어링, Faster-Whisper 한국어 STT, 베스트 샷 인트로 생성, 동적 BGM 더킹, HDR→SDR 톤매핑, 상황별 트랜지션·오디오 크로스페이드, FFmpeg HEVC NVENC 렌더링) |
 | [`autocut_timeline.py`](file:///d:/workspace/autocut/autocut_timeline.py) | **프리미어식 하단 타임라인** (썸네일 클립 배치, 드래그 순서 변경, 기기 시간 보정, 클립 회전, `편집결과_<날짜>/<날짜>_타임라인순서.json` 저장) |
 | `autocut_session.json` (자동 생성, git 제외) | 마지막 작업 상태(설정·선택 폴더) — 다음 실행 때 자동 복원 |
+| `assets/autocut_icon.ico` / `.png` | 시네마 카메라 프로그램 아이콘 (창·작업 표시줄·스플래시) |
 | [`AutoCut_Studio.vbs`](file:///d:/workspace/autocut/AutoCut_Studio.vbs) | **무콘솔(Windowless) 백그라운드 런처** (검은색 `cmd` 창 없이 즉시 GUI만 깔끔하게 실행) |
 | [`AutoCut_Studio.bat`](file:///d:/workspace/autocut/AutoCut_Studio.bat) | 배치 파일 실행 런처 (`AutoCut_Studio.vbs` 호출) |
 | [`custom_styles.json`](file:///d:/workspace/autocut/custom_styles.json) | 유튜브 URL 또는 로컬 레퍼런스 영상을 분석해 학습된 **맞춤형 편집 스타일 프리셋** 저장소 |
@@ -29,7 +30,7 @@ flowchart TD
     C --> D["🧠 3. AI 멀티모달 분석 (스마트 캐시 지원)"]
     D --> D1["🎙️ FFT 노이즈 제거 + Faster-Whisper 한국어 음성인식(STT)"]
     D --> D2["👁️ OpenCV 키프레임 비전 분석 (얼굴 검출 · 선명도 · 색감 · 흔들림 감점)"]
-    D1 & D2 --> E["✂️ 4. 편집 모드별 최적 컷 구간 선택 (일반 8~12분 / 하이라이트 3~5분)"]
+    D1 & D2 --> E["✂️ 4. 편집 모드별 최적 컷 구간 선택 + 편집 길이 상한 (원본의 60% 이하)"]
     E --> F["🌟 5. 정방향 베스트 샷 추출 & 3초 인트로 생성 (반투명 타이틀 + 하얀 테두리)"]
     F --> G["🎵 6. 클립별 렌더링 (HDR 톤매핑·회전) + 상단 날짜/로고 HUD + 동적 BGM 믹싱 (영상 6% / 사진 38%)"]
     G --> H["✨ 7. 상황별 xfade 트랜지션 (실제 영상 겹침) + 오디오 크로스페이드 + 마지막 블랙 페이드아웃"]
@@ -64,6 +65,8 @@ flowchart TD
   * **대화 보호 규칙**: 말하고 있는 도중에는 절대 컷이 잘리지 않도록 인접 대화를 병합하고 앞뒤 여백(`0.35초` / `0.55초`)을 확보합니다.
 * **비전/모션 키프레임 분석 ([`analyze_video_keyframes`](file:///d:/workspace/autocut/autocut_engine.py#L341-L407))**:
   * OpenCV Haar Cascade 얼굴 검출(가족 클로즈업 가산점), 라플라시안 선명도, 색채 생동감, 옵티컬 플로우(Optical Flow) 카메라 흔들림 감점을 종합해 최고의 장면을 선별합니다.
+* **편집 길이 상한 ([`enforce_edit_length_budget`](file:///d:/workspace/autocut/autocut_engine.py), v2.6.0)**:
+  * 편집된 영상 길이를 원본 영상 전체 길이의 **60% 이하**(기본, GUI에서 40~80%·제한 없음)로 맞춥니다. 무음 구간 2.5초로 축소 → 대화 앞뒤 무음 여백 0.4초로 축소 → 영상별 최고 구간만 남기기 → 저점수(말소리 없는) 영상부터 제외 순으로 줄이며, 점수는 말소리 비율×3 + 미학 + VLM 하이라이트입니다.
 
 ---
 
@@ -123,7 +126,8 @@ flowchart TD
   * **중앙 카드**: 편집 모드(일반/하이라이트), 인트로 제목·로고 입력창(글자 겹침 없는 2열 다크 폼), 큼직한 `✔` (v-체크) 커스텀 체크박스 옵션
   * **우측 카드**: 출력 인코딩 사양(`HEVC`, 해상도, FPS, `bps`), 스타일 프리셋 및 유튜브 URL 학습기
   * **하단 좌·우 분할**: 실시간 **CPU · GPU0(iGPU) · GPU1(NVIDIA, NVENC·VRAM) · NPU 사용률 그래프**([`SystemResourceMonitor`](file:///d:/workspace/autocut/autocut_gui.py) — 작업 관리자와 같은 Windows `GPU Engine` 성능 카운터, GPU 번호도 작업 관리자 순서)와 실시간 진행 로그 창
-  * **최하단 타임라인 ([`TimelinePanel`](file:///d:/workspace/autocut/autocut_timeline.py))**: 선택한 날짜 폴더의 영상·사진을 썸네일 클립으로 배치. 드래그·`Ctrl+←/→`로 순서 변경, 우클릭으로 기기 시간 보정·회전, ⚠ 시각 이상 표시, HDR 배지.
+  * **최하단 타임라인 ([`TimelinePanel`](file:///d:/workspace/autocut/autocut_timeline.py))**: 선택한 날짜 폴더의 영상·사진을 썸네일 클립으로 배치. 드래그·`Ctrl+←/→`로 순서 변경, 우클릭으로 기기 시간 보정·회전, ⚠ 시각 이상 표시, HDR 배지. `Ctrl/Shift+클릭`·`Ctrl+A` 다중 선택 후 함께 이동·회전 (v2.6.0), 굵고 대비 높은 스크롤 바 + `보는 중 a–b / N` 위치 표시.
+* **프로그램 아이콘 (v2.6.0)**: 시네마 카메라 아이콘(`assets/autocut_icon.ico`)이 창 제목줄·작업 표시줄·스플래시에 표시됩니다.
 * **작업 상태 저장 (v2.4.0)**: 설정·선택 폴더를 자동 저장/복원(`Ctrl+S` 즉시 저장), 메뉴에서 설정 + 모든 폴더 타임라인을 `*.autocut.json`으로 내보내기/불러오기.
 
 ---
