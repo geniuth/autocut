@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import glob
 import json
@@ -6,7 +7,7 @@ import random
 import shutil
 import tempfile
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Callable, List, Dict, Tuple, Optional
 
@@ -49,7 +50,15 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps, ExifTags
 from faster_whisper import WhisperModel
 
-AUTOCUT_VERSION = "2.2.0"
+# iPhone HEIC photos: without pillow-heif, PIL can't read their EXIF shooting time (falls back to file mtime)
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except Exception:
+    pass
+
+AUTOCUT_VERSION = "2.5.0"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -165,7 +174,7 @@ def get_video_info(filepath: str) -> Tuple[str, float]:
         duration = float(fmt.get("duration", 0.0) or 0.0)
         tags = fmt.get("tags", {}) or {}
         ct = (tags.get("com.apple.quicktime.creationdate") or tags.get("creation_time") or "").strip()
-        if ct and len(ct) >= 10 and ct[:4].isdigit():
+        if ct and len(ct) >= 10 and ct[:4].isdigit() and int(ct[:4]) >= 2000:
             date_str = ct[:10]
     except Exception:
         pass
@@ -189,15 +198,51 @@ def get_video_datetime_iso(filepath: str) -> str:
         ]
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8", "ignore")
         data = json.loads(out)
-        tags = data.get("format", {}).get("tags", {}) or {}
-        qt_ct = tags.get("com.apple.quicktime.creationdate", "").strip()
-        if qt_ct and len(qt_ct) >= 19 and qt_ct[:4].isdigit():
-            return qt_ct[:19].replace(" ", "T")
-        ct = tags.get("creation_time", "").strip()
-        if ct and len(ct) >= 19 and ct[:4].isdigit():
-            return ct[:19].replace(" ", "T")
+        ct = _video_datetime_from_tags(data.get("format", {}).get("tags", {}) or {})
+        if ct:
+            return ct
     except Exception:
         pass
+    return _datetime_fallback_iso(filepath)
+
+
+def _video_datetime_from_tags(tags: Dict[str, str]) -> str:
+    """
+    'YYYY-MM-DDTHH:MM:SS' from container tags (Apple local creationdate first, then creation_time), or ''.
+    Zero/placeholder dates (1904 QuickTime epoch, 1970 Unix epoch written by e.g. Google Photos exports) are ignored.
+    """
+    for key in ("com.apple.quicktime.creationdate", "creation_time"):
+        ct = str(tags.get(key, "")).strip()
+        if ct and len(ct) >= 19 and ct[:4].isdigit() and int(ct[:4]) >= 2000:
+            return ct[:19].replace(" ", "T")
+    return ""
+
+
+_UTC_NAME_RX = re.compile(r"^(?:PXL_)?(\d{8})_(\d{6})\d{0,3}(?:_iOS)?", re.IGNORECASE)
+_LOCAL_NAME_RX = re.compile(r"^(?:VID_|IMG_|MVIMG_)?(\d{8})_(\d{6})")
+
+
+def _datetime_fallback_iso(filepath: str) -> str:
+    """
+    When metadata has no usable time: Pixel (PXL_YYYYMMDD_HHMMSSmmm) and iOS-export (YYYYMMDD_HHMMSSmmm_iOS)
+    filenames are UTC -> converted to this PC's local time; Samsung/Android YYYYMMDD_HHMMSS names are already local.
+    Last resort: file modification time.
+    """
+    name = os.path.basename(filepath)
+    up = name.upper()
+    m = _UTC_NAME_RX.match(name)
+    if m and (up.startswith("PXL_") or "_IOS" in up):
+        try:
+            dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+            return dt.astimezone().strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            pass
+    m = _LOCAL_NAME_RX.match(name)
+    if m:
+        try:
+            return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            pass
     return datetime.fromtimestamp(os.path.getmtime(filepath)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
@@ -227,13 +272,168 @@ def get_photo_datetime_iso(filepath: str) -> str:
                             return f"{date_part}T{time_part}"
     except Exception:
         pass
-    return datetime.fromtimestamp(os.path.getmtime(filepath)).strftime("%Y-%m-%dT%H:%M:%S")
+    return _datetime_fallback_iso(filepath)
 
 
 def get_photo_date(filepath: str) -> str:
     """Return YYYY-MM-DD from EXIF DateTimeOriginal or file mtime."""
     iso_str = get_photo_datetime_iso(filepath)
     return iso_str[:10]
+
+
+def _join_make_model(make: str, model: str) -> str:
+    make, model = make.strip(), model.strip()
+    if not model:
+        return make
+    if make and not model.lower().replace(" ", "").startswith(make.lower().replace(" ", "")):
+        return f"{make} {model}"
+    return model
+
+
+def _guess_video_device(fmt_tags: Dict[str, str], v_tags: Dict[str, str], fname: str) -> str:
+    """Best-effort camera/device label from container tags, stream handler names, and file naming conventions."""
+    t = {str(k).lower(): str(v) for k, v in (fmt_tags or {}).items()}
+    make = t.get("com.apple.quicktime.make") or t.get("com.android.manufacturer") or t.get("make") or ""
+    model = t.get("com.apple.quicktime.model") or t.get("com.android.model") or t.get("model") or ""
+    if model or make:
+        return _join_make_model(make, model)
+    handlers = " ".join(str(v) for v in (v_tags or {}).values()).lower()
+    fw = t.get("firmware", "").upper()
+    if "gopro" in handlers or fw.startswith("HD") or fw.startswith("H2"):
+        m = re.match(r"HD(\d+)\.", fw)
+        return f"GoPro HERO{m.group(1)}" if m else "GoPro"
+    up = fname.upper()
+    if "dji" in handlers or "dji" in json.dumps(t).lower() or up.startswith("DJI_"):
+        return "DJI"
+    if t.get("major_brand", "").upper().startswith("XAVC"):
+        return "Sony (XAVC)"
+    if "insta360" in handlers or up.endswith(".INSV"):
+        return "Insta360"
+    if up.startswith("PXL_"):
+        return "Google Pixel"
+    if "com.android.version" in t or re.match(r"^\d{8}_\d{6}", fname):
+        return "Android 폰"
+    return "기타 기기"
+
+
+def _guess_photo_device(filepath: str) -> str:
+    try:
+        with Image.open(filepath) as img:
+            exif = img.getexif() or {}
+            label = _join_make_model(str(exif.get(271, "") or ""), str(exif.get(272, "") or ""))
+            if label:
+                return label.replace("\x00", "").strip()
+    except Exception:
+        pass
+    up = os.path.basename(filepath).upper()
+    if up.startswith("DJI_"):
+        return "DJI"
+    if up.startswith("KAKAOTALK_"):
+        return "카카오톡 받은 사진"
+    return "기타 기기"
+
+
+def probe_media_item(filepath: str) -> Dict:
+    """
+    Lightweight metadata for the timeline panel (one ffprobe call per video):
+    {type, path, file, creation_time, duration, device, dynamic_range, dr_label}.
+    creation_time uses the same rules as the render pipeline so both sort identically.
+    """
+    fname = os.path.basename(filepath)
+    ext = os.path.splitext(fname)[1].lower()
+    if ext in PHOTO_EXTS:
+        return {
+            "type": "photo",
+            "path": filepath,
+            "file": fname,
+            "creation_time": get_photo_datetime_iso(filepath),
+            "duration": 3.0,
+            "device": _guess_photo_device(filepath),
+            "dynamic_range": "SDR",
+            "dr_label": "SDR",
+        }
+
+    fmt_tags: Dict[str, str] = {}
+    v_tags: Dict[str, str] = {}
+    duration = 0.0
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_entries",
+            "format=duration:format_tags:stream=codec_type:stream_tags",
+            filepath,
+        ]
+        data = json.loads(subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8", "ignore"))
+        fmt = data.get("format", {}) or {}
+        duration = float(fmt.get("duration", 0.0) or 0.0)
+        fmt_tags = fmt.get("tags", {}) or {}
+        for st in data.get("streams", []) or []:
+            if st.get("codec_type") == "video":
+                v_tags = st.get("tags", {}) or {}
+                break
+    except Exception:
+        pass
+    ct = _video_datetime_from_tags(fmt_tags) or _datetime_fallback_iso(filepath)
+    dr = detect_dynamic_range(filepath)
+    return {
+        "type": "video",
+        "path": filepath,
+        "file": fname,
+        "creation_time": ct,
+        "duration": round(duration, 2),
+        "device": _guess_video_device(fmt_tags, v_tags, fname),
+        "dynamic_range": dr["range"],
+        "dr_label": dr["label"],
+    }
+
+
+def extract_media_thumbnail(
+    filepath: str, media_type: str, duration: float = 0.0, width: int = 192, height: int = 108
+) -> Optional[Image.Image]:
+    """Small upright RGB thumbnail (HDR clips tone-mapped to SDR so they don't look washed out)."""
+    if media_type == "photo":
+        try:
+            with Image.open(filepath) as im:
+                im = ImageOps.exif_transpose(im).convert("RGB")
+                im.thumbnail((width, height), Image.Resampling.LANCZOS)
+                return im
+        except Exception:
+            pass  # e.g. HEIC without pillow-heif -> let ffmpeg try
+    try:
+        seek = min(1.0, duration * 0.1) if media_type == "video" else 0.0
+        _, tm = get_hdr_tonemap_vf(detect_dynamic_range(filepath), gpu=False) if media_type == "video" else ([], "")
+        # even dimensions: portrait clips would otherwise scale to an odd width that zscale (4:2:0) rejects
+        vf = f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2" + (f",{tm}" if tm else "")
+        cmd = [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-ss",
+            f"{seek:.2f}",
+            "-i",
+            filepath,
+            "-frames:v",
+            "1",
+            "-vf",
+            vf,
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "png",
+            "-",
+        ]
+        raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30).stdout
+        if raw:
+            import io
+
+            return Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception:
+        pass
+    return None
 
 
 def _fps_to_ffmpeg_expr(out_fps: float = 60.0) -> str:
@@ -251,9 +451,11 @@ def _build_vcodec_args(video_codec: str = "hevc_nvenc", video_bitrate_bps: int =
     if "hevc" in codec or "265" in codec:
         enc = "hevc_nvenc"
         tag_args = ["-tag:v", "hvc1"]
+        bsf = "hevc_metadata"
     else:
         enc = "h264_nvenc"
         tag_args = []
+        bsf = "h264_metadata"
     bps = max(2_000_000, int(video_bitrate_bps))
     max_bps = int(bps * 1.25)
     buf_bps = int(bps * 2.0)
@@ -271,6 +473,10 @@ def _build_vcodec_args(video_codec: str = "hevc_nvenc", video_bitrate_bps: int =
         str(max_bps),
         "-bufsize",
         str(buf_bps),
+        # Output is always an SDR Rec.709 master (HDR clips are tone-mapped), so tag it explicitly.
+        # Written into the bitstream VUI: NVENC ignores -color_* output options, and concat -c copy keeps the VUI.
+        "-bsf:v",
+        f"{bsf}=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
     ]
 
 
@@ -412,6 +618,9 @@ def get_color_profile_filter(
         cfg = next(iter(COLOR_PROFILE_PRESETS.values()))
 
     cid = cfg["id"]
+    # HDR (HLG / PQ) clips are tone-mapped to Rec.709 separately; Log curves on top would double-correct them
+    if cid != "none" and filepath and os.path.exists(filepath) and detect_dynamic_range(filepath)["range"] != "SDR":
+        return ""
     if cid == "auto":
         if filepath and os.path.exists(filepath):
             is_dlog, det_id = detect_dji_or_dlog_clip(filepath)
@@ -425,6 +634,114 @@ def get_color_profile_filter(
                         return str(v.get("vf", "")).strip()
         return ""
     return str(cfg.get("vf", "")).strip()
+
+
+# ==============================================================================
+# HDR (HLG / HDR10 / Dolby Vision) auto-detection & SDR Rec.709 tone mapping
+# ==============================================================================
+
+_DYNAMIC_RANGE_CACHE: Dict[Tuple[str, float], Dict[str, str]] = {}
+_TONEMAP_BACKEND: Optional[str] = None
+
+# GPU path: libplacebo on Vulkan (reads Dolby Vision RPU too). The device is left to Vulkan's default pick,
+# which on hybrid laptops is the iGPU — that keeps the NVIDIA GPU free for NVDEC/NVENC.
+_LIBPLACEBO_HW_ARGS = ["-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk"]
+
+
+def detect_dynamic_range(filepath: str) -> Dict[str, str]:
+    """
+    Classify a video's dynamic range from its ffprobe color metadata.
+    Returns {"range": "SDR" | "HLG" | "HDR10", "trc": ffmpeg transfer name, "label": display label}.
+    iPhone Dolby Vision 8.4 is HLG-compatible, Samsung HDR10+ / DV profile 5 are PQ.
+    """
+    try:
+        key = (filepath, os.path.getmtime(filepath))
+    except OSError:
+        return {"range": "SDR", "trc": "bt709", "label": "SDR"}
+    if key in _DYNAMIC_RANGE_CACHE:
+        return _DYNAMIC_RANGE_CACHE[key]
+
+    res = {"range": "SDR", "trc": "bt709", "label": "SDR"}
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=color_transfer,color_primaries:stream_side_data=side_data_type,dv_profile,dv_bl_signal_compatibility_id",
+            filepath,
+        ]
+        data = json.loads(subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8", "ignore"))
+        st = (data.get("streams") or [{}])[0]
+        trc = str(st.get("color_transfer", "")).lower()
+        side = st.get("side_data_list", []) or []
+        side_types = " ".join(str(s.get("side_data_type", "")) for s in side).lower()
+        dovi = next((s for s in side if "dovi" in str(s.get("side_data_type", "")).lower()), None)
+        dv_profile = dovi.get("dv_profile") if dovi else None
+        dv_compat = dovi.get("dv_bl_signal_compatibility_id") if dovi else None
+        dv_tag = (f" · Dolby Vision {dv_profile}" + (f".{dv_compat}" if dv_compat else "")) if dovi else ""
+        if trc == "arib-std-b67":
+            res = {"range": "HLG", "trc": "arib-std-b67", "label": f"HLG{dv_tag}"}
+        elif trc == "smpte2084":
+            label = "HDR10+" if "2094-40" in side_types else "HDR10"
+            res = {"range": "HDR10", "trc": "smpte2084", "label": f"{label}{dv_tag}"}
+        elif dv_profile == 5:
+            res = {"range": "HDR10", "trc": "smpte2084", "label": "Dolby Vision 5"}
+    except Exception:
+        pass
+    _DYNAMIC_RANGE_CACHE[key] = res
+    return res
+
+
+def _hdr_tonemap_backend() -> str:
+    """'libplacebo' when Vulkan + libplacebo work in this FFmpeg build, else 'zscale' (CPU). Probed once."""
+    global _TONEMAP_BACKEND
+    if _TONEMAP_BACKEND is None:
+        cmd = [
+            "ffmpeg",
+            "-v",
+            "error",
+            *_LIBPLACEBO_HW_ARGS,
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=gray:s=64x64:d=0.1,format=yuv420p10le",
+            "-vf",
+            "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc,"
+            "libplacebo=tonemapping=auto:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=yuv420p",
+            "-f",
+            "null",
+            "-",
+        ]
+        try:
+            ok = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+        except Exception:
+            ok = False
+        _TONEMAP_BACKEND = "libplacebo" if ok else "zscale"
+    return _TONEMAP_BACKEND
+
+
+def get_hdr_tonemap_vf(dr: Dict[str, str], gpu: bool = True) -> Tuple[List[str], str]:
+    """
+    Return (extra_ffmpeg_input_args, filter_chain) converting an HDR clip to 8-bit SDR Rec.709.
+    SDR clips return ([], ""). gpu=False forces the CPU zscale path (cheap for tiny analysis frames).
+    """
+    if not dr or dr.get("range", "SDR") == "SDR":
+        return [], ""
+    trc = dr.get("trc", "arib-std-b67")
+    if gpu and _hdr_tonemap_backend() == "libplacebo":
+        return list(_LIBPLACEBO_HW_ARGS), (
+            f"setparams=color_primaries=bt2020:color_trc={trc}:colorspace=bt2020nc,"
+            "libplacebo=tonemapping=auto:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=yuv420p"
+        )
+    return [], (
+        f"zscale=tin={trc}:pin=bt2020:min=bt2020nc:t=linear:p=bt2020:npl=203,format=gbrpf32le,"
+        "zscale=p=bt709,tonemap=tonemap=mobius:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+    )
 
 
 
@@ -528,6 +845,95 @@ def load_whisper_model(model_size: str = "large-v3-turbo", log_fn: Callable[[str
         return WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=cpu_threads)
 
 
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST_URL", "http://127.0.0.1:11434")
+OLLAMA_PREFERRED_VLM_MODELS = ("qwen2.5vl:7b", "qwen2.5vl", "internvl")
+
+
+def _find_ollama_exe() -> Optional[str]:
+    exe = shutil.which("ollama")
+    if exe:
+        return exe
+    for cand in (
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama.exe"),
+        r"C:\Program Files\Ollama\ollama.exe",
+    ):
+        if cand and os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _ollama_list_models(timeout: float = 1.5) -> Optional[List[str]]:
+    try:
+        req = urllib.request.Request(f"{OLLAMA_HOST}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+        return [m.get("name", "") for m in data.get("models", [])]
+    except Exception:
+        return None
+
+
+def ensure_ollama_server(log_fn: Callable[[str], None] = print, wait_sec: float = 15.0) -> bool:
+    """Start the local Ollama server in the background (no console window) if it is installed but not running."""
+    if _ollama_list_models() is not None:
+        return True
+    exe = _find_ollama_exe()
+    if not exe:
+        return False
+    try:
+        flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+        subprocess.Popen(
+            [exe, "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+        log_fn("🦙 로컬 Ollama 서버를 백그라운드로 시작합니다...")
+    except Exception:
+        return False
+    import time
+
+    t0 = time.time()
+    while time.time() - t0 < wait_sec:
+        if _ollama_list_models(timeout=1.0) is not None:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def detect_ollama_vlm_model(log_fn: Callable[[str], None] = print) -> Optional[str]:
+    """Return the installed Ollama Qwen2.5-VL / InternVL model name (preferring qwen2.5vl:7b), or None."""
+    if not ensure_ollama_server(log_fn=log_fn):
+        return None
+    names = _ollama_list_models() or []
+    lowered = [(n, n.lower()) for n in names]
+    for pref in OLLAMA_PREFERRED_VLM_MODELS:
+        for orig, low in lowered:
+            if low == pref or low.startswith(pref):
+                return orig
+    for orig, low in lowered:
+        if "qwen2.5vl" in low or "qwen2.5-vl" in low or "internvl" in low:
+            return orig
+    log_fn("ℹ️ Ollama는 실행 중이지만 Qwen2.5-VL 모델이 없습니다. (설치: ollama pull qwen2.5vl:7b)")
+    return None
+
+
+def unload_ollama_model(model_name: str):
+    """Ask Ollama to evict the model from VRAM immediately (keep_alive=0) before NVENC rendering."""
+    try:
+        payload = json.dumps({"model": model_name, "keep_alive": 0}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{OLLAMA_HOST}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception:
+        pass
+
+
 class AestheticAndMultimodalEngine:
     """
     Unified Vision Aesthetic & Multimodal Video Understanding Engine:
@@ -563,18 +969,9 @@ class AestheticAndMultimodalEngine:
         self._init_engines()
 
     def _init_engines(self):
-        # 1. Check if local Ollama has qwen2.5vl or internvl2.5 running
-        try:
-            req = urllib.request.Request("http://127.0.0.1:11434/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=0.6) as resp:
-                data = json.loads(resp.read().decode("utf-8", "ignore"))
-                for m in data.get("models", []):
-                    mname = m.get("name", "").lower()
-                    if "qwen2.5vl" in mname or "qwen2.5-vl" in mname or "internvl" in mname:
-                        self.ollama_vlm_model = m.get("name")
-                        break
-        except Exception:
-            self.ollama_vlm_model = None
+        # 1. Start local Ollama (if installed) and detect Qwen2.5-VL / InternVL 2.5
+        self.ollama_vlm_model = detect_ollama_vlm_model(log_fn=self.log_fn)
+        self._ollama_fail_count = 0
 
         # 2. Load CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5) + Multimodal Zero-Shot Encoder on CUDA
         try:
@@ -633,10 +1030,14 @@ class AestheticAndMultimodalEngine:
             self.log_fn(f"ℹ️ CLIP/VLM 딥러닝 가속기 경량 모드 전환: {e}")
             self.clip_model = None
 
-    def score_bgr_frames_and_caption(self, bgr_frames: List[np.ndarray]) -> Tuple[List[float], str, float]:
+    def score_bgr_frames_and_caption(
+        self, bgr_frames: List[np.ndarray], use_vlm: bool = True
+    ) -> Tuple[List[float], str, float]:
         """
         Given a list of BGR frames from a clip:
         Returns (aesthetic_scores_0_to_10, best_korean_scene_caption, vlm_highlight_score_0_to_10).
+        If use_vlm and a local Ollama Qwen2.5-VL / InternVL model is available, the caption and
+        highlight score come from the VLM; otherwise CLIP zero-shot classification is used.
         """
         if not bgr_frames:
             return [], "오늘의 여행 기록", 7.0
@@ -648,7 +1049,12 @@ class AestheticAndMultimodalEngine:
                 g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
                 sh = min(float(cv2.Laplacian(g, cv2.CV_64F).var()) / 250.0, 4.0)
                 scores.append(round(5.0 + sh, 2))
-            return scores, "오늘의 여행 & 일상 기록", float(np.mean(scores))
+            caption, hl = "오늘의 여행 & 일상 기록", float(np.mean(scores))
+            if use_vlm:
+                vlm_res = self._ollama_describe(bgr_frames)
+                if vlm_res:
+                    caption, hl = vlm_res
+            return scores, caption, hl
 
         try:
             import torch
@@ -678,9 +1084,68 @@ class AestheticAndMultimodalEngine:
                 best_caption, _, base_hl = self.SCENE_PROMPTS_KO_EN[best_sc_idx]
                 vlm_hl_score = round(float(np.clip(base_hl * 0.55 + max(aes_scores) * 0.45, 1.0, 9.9)), 2)
 
+            if use_vlm:
+                vlm_res = self._ollama_describe(bgr_frames)
+                if vlm_res:
+                    v_cap, v_hl = vlm_res
+                    best_caption = v_cap
+                    vlm_hl_score = round(float(np.clip(v_hl * 0.6 + max(aes_scores) * 0.4, 1.0, 9.9)), 2)
+
             return aes_scores, best_caption, vlm_hl_score
         except Exception:
             return [6.5] * len(bgr_frames), "오늘의 여행 & 일상 기록", 6.5
+
+    def _ollama_describe(self, bgr_frames: List[np.ndarray]) -> Optional[Tuple[str, float]]:
+        """Send a 2x2 storyboard of the clip to local Ollama Qwen2.5-VL / InternVL and parse caption + highlight."""
+        if not self.ollama_vlm_model or self._ollama_fail_count >= 3:
+            return None
+        try:
+            import base64
+
+            n = len(bgr_frames)
+            picks = [bgr_frames[min(n - 1, int(i * n / 4))] for i in range(4)]
+            tiles = [cv2.resize(f, (448, 252), interpolation=cv2.INTER_AREA) for f in picks]
+            grid = np.vstack([np.hstack(tiles[0:2]), np.hstack(tiles[2:4])])
+            ok, buf = cv2.imencode(".jpg", grid, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+            if not ok:
+                return None
+            img_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+
+            prompt = (
+                "이 이미지는 가족 여행/일상 영상 한 클립에서 시간순으로 뽑은 4장면(좌상→우상→좌하→우하)입니다. "
+                "영상 자막 태그로 쓸 자연스러운 한국어 장면 설명을 6~16자로 한 줄 작성하고, "
+                "하이라이트로 쓸 만한 정도를 0~10 점수로 매기세요. "
+                '반드시 JSON만 출력: {"caption": "...", "highlight": 0~10 숫자}'
+            )
+            payload = {
+                "model": self.ollama_vlm_model,
+                "prompt": prompt,
+                "images": [img_b64],
+                "stream": False,
+                "format": "json",
+                "keep_alive": "10m",
+                "options": {"temperature": 0.2, "num_predict": 80},
+            }
+            req = urllib.request.Request(
+                f"{OLLAMA_HOST}/api/generate",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = json.loads(resp.read().decode("utf-8", "ignore"))
+            parsed = json.loads(data.get("response", "{}") or "{}")
+            caption = str(parsed.get("caption", "")).strip().strip('"').replace("\n", " ")
+            hl = float(parsed.get("highlight", 7.0))
+            if not caption:
+                return None
+            self._ollama_fail_count = 0
+            return caption[:24], float(np.clip(hl, 0.0, 10.0))
+        except Exception as e:
+            self._ollama_fail_count += 1
+            if self._ollama_fail_count >= 3:
+                self.log_fn(f"⚠️ Ollama VLM 응답 실패가 반복되어 CLIP 장면 분류로 전환합니다: {e}")
+            return None
 
     def close(self):
         self.clip_model = None
@@ -688,6 +1153,8 @@ class AestheticAndMultimodalEngine:
         self.pos_aes_feat = None
         self.neg_aes_feat = None
         self.scene_text_feats = None
+        if self.ollama_vlm_model:
+            unload_ollama_model(self.ollama_vlm_model)
         _release_cuda_vram()
 
 
@@ -813,6 +1280,8 @@ def analyze_video_keyframes(
     """
     w, h = 160, 90
     frame_size = w * h * 3
+    # Tone-map HDR after downscaling so washed-out HLG/PQ frames don't get low aesthetic/saturation scores
+    _, hdr_tm = get_hdr_tonemap_vf(detect_dynamic_range(video_path), gpu=False)
     cmd = [
         "ffmpeg",
         "-v",
@@ -824,7 +1293,7 @@ def analyze_video_keyframes(
         "-i",
         video_path,
         "-vf",
-        f"scale={w}:{h}",
+        f"scale={w}:{h}" + (f",{hdr_tm}" if hdr_tm else ""),
         "-fps_mode",
         "vfr",
         "-f",
@@ -1284,6 +1753,11 @@ def _ensure_upright_bgr(img_bgr: np.ndarray, face_cascade=None) -> Tuple[np.ndar
     return img_bgr, False
 
 
+def rotation_vf(degrees: int) -> str:
+    """FFmpeg filter for a manual clockwise rotation (0/90/180/270), '' for none."""
+    return {90: "transpose=1", 180: "hflip,vflip", 270: "transpose=2"}.get(int(degrees or 0) % 360, "")
+
+
 def prepare_upright_photo_1080p(
     photo_path: str,
     out_jpg_path: str,
@@ -1291,10 +1765,12 @@ def prepare_upright_photo_1080p(
     face_cascade=None,
     out_width: int = 1920,
     out_height: int = 1080,
+    manual_rotation: int = 0,
 ) -> Tuple[bool, bool]:
     """
     Load a photo, apply EXIF orientation transpose (fixing iOS/Android Orientation=3/6/8 upside-down/rotated photos),
     verify visual upright orientation, and render a clean WxH RGB JPEG.
+    - manual_rotation: clockwise degrees chosen on the timeline; it replaces the automatic upside-down check.
     - If cover_mode=True and landscape (w >= h): fills WxH cleanly via center-crop LANCZOS.
     - Otherwise: places aspect-ratio-preserved photo over a softly blurred WxH background of itself.
     Returns (success, is_landscape).
@@ -1304,14 +1780,20 @@ def prepare_upright_photo_1080p(
             # 1. CRITICAL: Apply EXIF Orientation (1..8, e.g., 3=180°, 6=90°CW, 8=270°CW)
             im = ImageOps.exif_transpose(raw_im).convert("RGB")
 
+        rot = int(manual_rotation or 0) % 360
+        if rot:
+            im = im.rotate(-rot, expand=True)  # PIL rotates counter-clockwise
+
         w, h = im.size
         is_landscape = w >= h
 
         # 2. Also run visual upside-down check in case camera recorded upside down with Orientation=1
-        bgr = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
-        bgr, flipped = _ensure_upright_bgr(bgr, face_cascade=face_cascade)
-        if flipped:
-            im = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        #    (skipped when the user rotated it by hand — their choice wins)
+        if not rot:
+            bgr = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+            bgr, flipped = _ensure_upright_bgr(bgr, face_cascade=face_cascade)
+            if flipped:
+                im = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
         W, H = int(out_width), int(out_height)
         if cover_mode and is_landscape:
@@ -1384,7 +1866,10 @@ def find_best_shot_frame(
             cand_jpg = os.path.join(tmpdir, f"cand_{cand_counter:02d}.jpg")
             is_landscape = True
             try:
+                manual_rot = int(clip.get("rotation", 0) or 0) % 360
                 if ctype == "video":
+                    _, hdr_tm = get_hdr_tonemap_vf(detect_dynamic_range(fpath), gpu=False)
+                    rot_vf = rotation_vf(manual_rot)
                     cmd = [
                         "ffmpeg",
                         "-y",
@@ -1399,7 +1884,9 @@ def find_best_shot_frame(
                         "-frames:v",
                         "1",
                         "-vf",
-                        f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2",
+                        (f"{hdr_tm}," if hdr_tm else "")
+                        + (f"{rot_vf}," if rot_vf else "")
+                        + f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2",
                         "-q:v",
                         "2",
                         cand_jpg,
@@ -1410,9 +1897,10 @@ def find_best_shot_frame(
                     img_bgr = cv2.imread(cand_jpg)
                     if img_bgr is None:
                         continue
-                    img_bgr, was_flipped = _ensure_upright_bgr(img_bgr, face_cascade=face_cascade)
-                    if was_flipped:
-                        cv2.imwrite(cand_jpg, img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                    if not manual_rot:
+                        img_bgr, was_flipped = _ensure_upright_bgr(img_bgr, face_cascade=face_cascade)
+                        if was_flipped:
+                            cv2.imwrite(cand_jpg, img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
                 else:
                     ok, is_landscape = prepare_upright_photo_1080p(
                         fpath,
@@ -1421,6 +1909,7 @@ def find_best_shot_frame(
                         face_cascade=face_cascade,
                         out_width=W,
                         out_height=H,
+                        manual_rotation=manual_rot,
                     )
                     if not ok or not os.path.exists(cand_jpg):
                         continue
@@ -1457,7 +1946,7 @@ def find_best_shot_frame(
         # Score candidates with CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5)
         try:
             vlm_eng = get_aesthetic_vlm_engine(log_fn=log_fn)
-            aes_list, _, _ = vlm_eng.score_bgr_frames_and_caption([c[4] for c in candidates])
+            aes_list, _, _ = vlm_eng.score_bgr_frames_and_caption([c[4] for c in candidates], use_vlm=False)
         except Exception:
             aes_list = [6.5] * len(candidates)
 
@@ -2295,6 +2784,292 @@ def _extract_last_frame_clip(
     return os.path.exists(tail_mp4_path)
 
 
+# ==============================================================================
+# Transitions: context-aware choice, real-footage handles, audio crossfades
+# ==============================================================================
+
+AUDIO_XFADE_SEC = 0.25  # every cut out of a video clip gets this audio crossfade (no clicks / hard sound cuts)
+INTRO_TAIL_SEC = 0.7  # still of the intro's last frame used to dissolve into the first shot
+SCENE_GAP_SEC = 20 * 60  # shooting-time gap that counts as a new scene (place / time of day)
+
+# Custom xfade expressions are written out inline on purpose: xfade evaluates them on several slice
+# threads that share st()/ld() registers, so registers produce per-pixel garbage. (P runs 1 -> 0.)
+_Q = "(1-P)"
+_SMOOTHERSTEP = f"({_Q}*{_Q}*{_Q}*({_Q}*({_Q}*6-15)+10))"
+_WHIP_X = f"(X+{_SMOOTHERSTEP}*W)"
+
+
+def _plane_sample(src: str, x: str) -> str:
+    return f"if(eq(PLANE,0),{src}0({x},Y),if(eq(PLANE,1),{src}1({x},Y),if(eq(PLANE,2),{src}2({x},Y),{src}3({x},Y))))"
+
+
+# Whip: the outgoing shot is pushed left with smootherstep easing and the incoming one follows;
+# a short tmix over the transition window adds the motion-blur smear.
+_XFADE_WHIP_EXPR = f"if(lt({_WHIP_X},W),{_plane_sample('a', _WHIP_X)},{_plane_sample('b', f'({_WHIP_X}-W)')})"
+# Light leak: a film dissolve with a warm glow blooming from the top-right corner, peaking mid-transition.
+_LEAK_BASE = "(A*P+B*(1-P))"
+_LEAK_GLOW = "(0.85*pow(sin(PI*(1-P)),1.5)*exp(-(pow(X/W-0.82,2)+pow(Y/H-0.18,2))/0.16))"
+_XFADE_LIGHTLEAK_EXPR = f"{_LEAK_BASE}+{_LEAK_GLOW}*(if(eq(PLANE,0),235,if(eq(PLANE,1),96,170))-{_LEAK_BASE})"
+
+TRANSITION_LABELS_KO = {
+    "none": "컷",
+    "fade": "필름 디졸브",
+    "fadewhite": "화이트 딥",
+    "fadeblack": "블랙 딥",
+    "whip": "휩 팬",
+    "lightleak": "라이트 릭",
+}
+
+
+def _transition_style_for(style_cfg: Dict) -> str:
+    """'energetic' / 'cinematic' / 'smooth' transition vocabulary for a style preset."""
+    sid = str(style_cfg.get("id", ""))
+    if sid == "fast_youtuber" or float(style_cfg.get("avg_cut_sec", 6.0) or 6.0) < 4.5:
+        return "energetic"
+    if sid == "jeju_cinematic":
+        return "cinematic"
+    return "smooth"
+
+
+def _clip_time_sec(clip: Dict, offset: float) -> Optional[float]:
+    try:
+        dt = datetime.strptime((clip.get("creation_time") or "")[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return (dt - datetime(1970, 1, 1)).total_seconds() + offset
+
+
+def plan_transition(
+    prev_cut: Optional[Tuple[Dict, float, float]],
+    cur_cut: Tuple[Dict, float, float],
+    edit_mode: str,
+    style: str,
+    prob: float,
+    rng: random.Random,
+) -> Tuple[str, float]:
+    """
+    Pick (transition, seconds) for the join into cur_cut from its context instead of at random:
+    a jump cut inside one shot stays a cut or a short dissolve, shots of the same scene get a film
+    dissolve, and a change of scene (>= 20 min apart or a new day) gets a dip to white/black, whip
+    pan or light leak depending on the edit mode and style. prev_cut None = from the intro.
+    """
+    if prev_cut is None:
+        return "fade", 0.6
+    (pc, _ps, pe), (cc, cs, _ce) = prev_cut, cur_cut
+    t_prev, t_cur = _clip_time_sec(pc, pe), _clip_time_sec(cc, cs)
+    new_day = (pc.get("creation_time") or "")[:10] != (cc.get("creation_time") or "")[:10]
+    scene_change = new_day or (t_prev is not None and t_cur is not None and abs(t_cur - t_prev) >= SCENE_GAP_SEC)
+    if scene_change:
+        if edit_mode == "talk":
+            return "fadeblack", 0.6
+        # (ffmpeg's built-in "zoomin" samples nearest-neighbour and looks blocky, so no cross zoom here)
+        if edit_mode == "drive":
+            return rng.choice([("whip", 0.4), ("whip", 0.4), ("fadewhite", 0.5)])
+        pools = {
+            "energetic": [("whip", 0.35), ("whip", 0.3), ("fadewhite", 0.4)],
+            "cinematic": [("fadeblack", 0.7), ("lightleak", 0.8), ("fadewhite", 0.6)],
+            "smooth": [("fadewhite", 0.6), ("lightleak", 0.7), ("whip", 0.4)],
+        }
+        return rng.choice(pools.get(style, pools["smooth"]))
+    if pc.get("path") == cc.get("path"):  # jump cut inside one shot
+        if edit_mode == "talk" or style == "energetic":
+            return "none", 0.0
+        return ("fade", 0.3) if rng.random() <= prob else ("none", 0.0)
+    if pc.get("type") == "photo" or cc.get("type") == "photo":
+        return "fade", 0.5
+    if edit_mode == "talk":
+        return ("fade", 0.3) if rng.random() < 0.25 * prob else ("none", 0.0)
+    if style == "energetic":
+        return rng.choice([("none", 0.0), ("fade", 0.25), ("whip", 0.3)]) if rng.random() <= prob else ("none", 0.0)
+    return ("fade", 0.45) if rng.random() <= prob else ("none", 0.0)
+
+
+def _xfade_video_graph(name: str, td: float) -> str:
+    """Filter graph from [0:v] (outgoing handle) and [1:v] (incoming cut) to [v]."""
+    if name == "whip":
+        return (
+            f"[0:v][1:v]xfade=transition=custom:duration={td:.3f}:offset=0:expr='{_XFADE_WHIP_EXPR}',"
+            f"split=2[x1][x2];[x1]trim=end={td:.3f},setpts=PTS-STARTPTS,tmix=frames=5[w];"
+            f"[x2]trim=start={td:.3f},setpts=PTS-STARTPTS[r];[w][r]concat=n=2:v=1:a=0,format=yuv420p[v]"
+        )
+    if name == "lightleak":
+        return f"[0:v][1:v]xfade=transition=custom:duration={td:.3f}:offset=0:expr='{_XFADE_LIGHTLEAK_EXPR}',format=yuv420p[v]"
+    return f"[0:v][1:v]xfade=transition={name}:duration={td:.3f}:offset=0,format=yuv420p[v]"
+
+
+_HAS_AUDIO_CACHE: Dict[str, bool] = {}
+
+
+def _has_audio_stream(path: str) -> bool:
+    if path not in _HAS_AUDIO_CACHE:
+        try:
+            out = subprocess.check_output(
+                ["ffprobe", "-v", "quiet", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", "ignore")
+            _HAS_AUDIO_CACHE[path] = bool(out.strip())
+        except Exception:
+            _HAS_AUDIO_CACHE[path] = False
+    return _HAS_AUDIO_CACHE[path]
+
+
+_AAC_ARGS = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+
+
+def _build_cut_render_cmd(
+    *,
+    src: str,
+    is_photo: bool,
+    s: float,
+    dur: float,
+    handle: float,
+    pre_vf: str,
+    scale_pad_vf: str,
+    post_vf: str,
+    hud_png: str,
+    bgm_file: str,
+    bgm_ss: float,
+    bgm_vol: float,
+    photo_bgm_af: str,
+    hw_args: List[str],
+    decode_args: List[str],
+    fade_out_v: str,
+    fade_out_a: str,
+    vcodec_args: List[str],
+    out_main: str,
+    out_handle: str = "",
+) -> List[str]:
+    """
+    One ffmpeg command for a cut (video or photo slide). With handle > 0 (video only) it also writes
+    out_handle: the next `handle` seconds of source past the cut's out point, processed by exactly the
+    same graph (color, HDR tone map, rotation, HUD, loudness, BGM), so the next join can dissolve out of
+    moving footage instead of a frozen frame and crossfade the sound.
+    """
+    total = dur + (handle if not is_photo else 0.0)
+    if is_photo:
+        cmd = ["ffmpeg", "-y", "-v", "error", "-loop", "1", "-t", f"{dur:.3f}", "-i", src]
+    else:
+        cmd = ["ffmpeg", "-y", "-v", "error", *hw_args, *decode_args, "-ss", f"{s:.3f}", "-t", f"{total:.3f}", "-i", src]
+    n_in = 1
+    hud_idx = bgm_idx = null_idx = None
+    if hud_png:
+        cmd += ["-i", hud_png]
+        hud_idx, n_in = n_in, n_in + 1
+    if bgm_file:
+        cmd += ["-stream_loop", "-1", "-ss", f"{bgm_ss:.2f}", "-t", f"{total:.3f}", "-i", bgm_file]
+        bgm_idx, n_in = n_in, n_in + 1
+    has_audio = (not is_photo) and _has_audio_stream(src)
+    if not has_audio and not (is_photo and bgm_file):
+        cmd += ["-f", "lavfi", "-t", f"{total:.3f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        null_idx, n_in = n_in, n_in + 1
+
+    split_h = handle > 0 and not is_photo
+    v = f"[0:v]{pre_vf}{scale_pad_vf}{post_vf}"
+    if hud_idx is not None:
+        v += f"[base];[base][{hud_idx}:v]overlay=0:0:format=auto"
+    v += f"{fade_out_v},format=yuv420p"
+    if split_h:
+        v += (
+            f",split=2[vf1][vf2];[vf1]trim=end={dur:.3f},setpts=PTS-STARTPTS[v];"
+            f"[vf2]trim=start={dur:.3f},setpts=PTS-STARTPTS[vh]"
+        )
+    else:
+        v += "[v]"
+
+    if is_photo and bgm_idx is not None:
+        a = f"[{bgm_idx}:a]{photo_bgm_af}"
+    else:
+        src_a = "[0:a]" if has_audio else f"[{null_idx}:a]"
+        chain = "highpass=f=85,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000" if has_audio else "anull"
+        if bgm_idx is not None:
+            a = (
+                f"{src_a}{chain}[va];[{bgm_idx}:a]volume={bgm_vol:.3f},aresample=48000[ba];"
+                f"[va][ba]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1:normalize=0{fade_out_a}"
+            )
+        else:
+            a = f"{src_a}{chain}{fade_out_a}"
+    if split_h:
+        a += (
+            f",asplit=2[af1][af2];[af1]atrim=end={dur:.3f},asetpts=PTS-STARTPTS[a];"
+            f"[af2]atrim=start={dur:.3f},asetpts=PTS-STARTPTS[ah]"
+        )
+    else:
+        a += "[a]"
+
+    cmd += ["-filter_complex", f"{v};{a}", "-map", "[v]", "-map", "[a]", *vcodec_args, *_AAC_ARGS]
+    if is_photo:
+        cmd += ["-shortest"]
+    cmd.append(out_main)
+    if split_h and out_handle:
+        cmd += ["-map", "[vh]", "-map", "[ah]", *vcodec_args, *_AAC_ARGS, out_handle]
+    return cmd
+
+
+def _join_cut(
+    prev_tail: str,
+    prev_tail_dur: float,
+    prev_tail_has_audio: bool,
+    raw_seg: str,
+    seg_out: str,
+    trans: str,
+    td: float,
+    vcodec_args: List[str],
+) -> Tuple[str, float, float]:
+    """
+    Blend the previous cut's tail into raw_seg over raw_seg's first seconds (the timeline length is
+    unchanged, so subtitles stay in sync). Returns (transition used, video seconds, audio crossfade seconds).
+    """
+    td = min(td, prev_tail_dur) if (prev_tail and trans != "none") else 0.0
+    use_v = td >= 0.15
+    ax = min(AUDIO_XFADE_SEC, prev_tail_dur) if (prev_tail and prev_tail_has_audio) else 0.0
+    use_a = ax >= 0.08
+    if not (use_v or use_a):
+        shutil.copyfile(raw_seg, seg_out)
+        return "none", 0.0, 0.0
+    graph = []
+    if use_v:
+        graph.append(_xfade_video_graph(trans, td))
+    if use_a:
+        # Linear (constant-gain) fades: the BGM is the same signal on both sides and sums back to
+        # its level exactly, while the dialogue dips at most ~3 dB for a quarter second.
+        graph.append(
+            f"[0:a]afade=t=out:st=0:d={ax:.3f}[ha];[1:a]afade=t=in:st=0:d={ax:.3f}[na];"
+            f"[ha][na]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[a]"
+        )
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", prev_tail, "-i", raw_seg, "-filter_complex", ";".join(graph)]
+    cmd += ["-map", "[v]", *vcodec_args] if use_v else ["-map", "1:v", "-c:v", "copy"]
+    cmd += ["-map", "[a]", *_AAC_ARGS] if use_a else ["-map", "1:a?", "-c:a", "copy"]
+    cmd.append(seg_out)
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if res.returncode != 0 or not os.path.exists(seg_out):
+        shutil.copyfile(raw_seg, seg_out)
+        return "none", 0.0, 0.0
+    return (trans if use_v else "none"), (td if use_v else 0.0), (ax if use_a else 0.0)
+
+
+def apply_manual_clip_order(clips_meta: List[Dict], manual_order: Optional[List[str]]) -> List[Dict]:
+    """
+    Reorder clips to the user's timeline order (list of file paths). Clips missing from the list
+    (e.g. files added after the timeline was arranged) are slotted in after the listed clip shot just before them.
+    """
+    if not manual_order:
+        return clips_meta
+    rank = {os.path.normcase(os.path.abspath(p)): i for i, p in enumerate(manual_order)}
+
+    def _rank(c: Dict) -> Optional[int]:
+        return rank.get(os.path.normcase(os.path.abspath(c.get("path", ""))))
+
+    listed = sorted((c for c in clips_meta if _rank(c) is not None), key=_rank)
+    for c in sorted((c for c in clips_meta if _rank(c) is None), key=lambda x: x.get("creation_time") or ""):
+        ct = c.get("creation_time") or ""
+        pos = 0
+        for i, lc in enumerate(listed):
+            if (lc.get("creation_time") or "") <= ct:
+                pos = i + 1
+        listed.insert(pos, c)
+    return listed
+
+
 def run_autocut_pipeline(
     date_folder_path: str,
     output_dir: str,
@@ -2322,12 +3097,17 @@ def run_autocut_pipeline(
     out_fps: float = 60.0,
     video_bitrate_bps: int = 25000000,
     video_codec: str = "hevc_nvenc",
+    manual_order: Optional[List[str]] = None,
+    clip_rotations: Optional[Dict[str, int]] = None,
     log_fn: Callable[[str], None] = print,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     stop_check_fn: Optional[Callable[[], bool]] = None,
 ) -> Dict:
     """
-    End-to-end AutoCut Studio 2026 (v2.2.0) pipeline with SOTA AI Models as Default:
+    End-to-end AutoCut Studio 2026 pipeline with SOTA AI Models as Default.
+    manual_order: file paths in the order arranged on the GUI timeline (None = shooting-time order).
+    clip_rotations: {file path: clockwise degrees (90/180/270)} set by hand on the timeline.
+    Models:
       1) Faster-Whisper large-v3-turbo (Speech & VAD)
       2) CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5)
       3) TransNetV2 / PySceneDetect ContentDetector (Shot Boundary Detection)
@@ -2357,7 +3137,8 @@ def run_autocut_pipeline(
     eq_chain = f",{eq_filter_str}" if eq_filter_str else ""
     max_sub_chars = int(style_cfg.get("max_sub_chars", 28))
     sub_font_size = int(style_cfg.get("sub_font_size", 52))
-    trans_pool = style_cfg.get("transitions") or TRANSITION_POOL
+    # Which transition is used is now chosen from context (plan_transition); a preset's legacy
+    # "transitions" list is ignored and only its transition_prob (how often shots dissolve) is used.
     trans_prob = float(style_cfg.get("transition_prob", 1.0))
 
     codec_label = "HEVC (H.265 NVENC)" if ("hevc" in video_codec.lower() or "265" in video_codec.lower()) else "H.264 (AVC NVENC)"
@@ -2395,6 +3176,17 @@ def run_autocut_pipeline(
     log_fn(f"🚀 [{date_name}] 자동 편집 시작 (영상 {len(video_files)}개, 사진 {len(photo_files)}개, 모드: {edit_mode})")
     log_fn(f"🎨 적용된 편집 스타일: {style_preset_name} ({style_cfg.get('desc', '')})")
 
+    dr_counts: Dict[str, int] = defaultdict(int)
+    for vp in video_files:
+        dr_counts[detect_dynamic_range(vp)["range"]] += 1
+    if dr_counts.get("HLG") or dr_counts.get("HDR10"):
+        backend = _hdr_tonemap_backend()
+        backend_label = "libplacebo GPU(Vulkan)" if backend == "libplacebo" else "zscale CPU"
+        log_fn(
+            f"🌈 HDR 자동 감지: SDR {dr_counts.get('SDR', 0)}개 · HLG {dr_counts.get('HLG', 0)}개 · "
+            f"HDR10/PQ {dr_counts.get('HDR10', 0)}개 -> 출력은 SDR(Rec.709 8-bit)로 통일, HDR 클립은 {backend_label} 톤매핑"
+        )
+
     report_json = os.path.join(output_dir, f"{date_name}_편집분석리포트.json")
     analysis_summary = None
     cached_video_map: Dict[str, Dict] = {}
@@ -2423,7 +3215,9 @@ def run_autocut_pipeline(
                         cpath = c.get("path", "")
                         ctype = c.get("type", "video")
                         ct_val = c.get("creation_time", "")
-                        if (not ct_val or len(ct_val) < 19 or ct_val.endswith("Z")) and os.path.exists(cpath):
+                        if (
+                            not ct_val or len(ct_val) < 19 or ct_val.endswith("Z") or ct_val[:4] < "2000"
+                        ) and os.path.exists(cpath):
                             new_ct = get_photo_datetime_iso(cpath) if ctype == "photo" else get_video_datetime_iso(cpath)
                             if new_ct and new_ct != ct_val:
                                 c["creation_time"] = new_ct
@@ -2602,7 +3396,17 @@ def run_autocut_pipeline(
             with open(report_json, "w", encoding="utf-8") as f:
                 json.dump(analysis_summary, f, ensure_ascii=False, indent=2)
 
-        if clips_meta:
+        rot_map = {os.path.normcase(os.path.abspath(p)): int(d) % 360 for p, d in (clip_rotations or {}).items()}
+        for c in clips_meta:
+            c["rotation"] = rot_map.get(os.path.normcase(os.path.abspath(c.get("path", ""))), 0)
+            if c["rotation"]:
+                log_fn(f"  ↻ [{c.get('file', '')}] 수동 회전 {c['rotation']}° 적용")
+
+        if manual_order:
+            clips_meta = apply_manual_clip_order(clips_meta, manual_order)
+            analysis_summary["clips"] = clips_meta
+            log_fn(f"🧲 타임라인에서 사용자가 지정한 클립 순서를 적용합니다 (총 {len(clips_meta)}개 클립)")
+        elif clips_meta:
             first_ct = (clips_meta[0].get("creation_time") or "").replace("T", " ")
             last_ct = (clips_meta[-1].get("creation_time") or "").replace("T", " ")
             log_fn(
@@ -2625,8 +3429,11 @@ def run_autocut_pipeline(
                 out_height=out_height,
             )
 
+        # Tail of the previous segment that the next cut dissolves out of: a real-footage handle
+        # (with audio) after a video cut, or a still of the last frame after the intro / a photo.
         prev_tail_mp4 = None
-        trans_dur = 0.45
+        prev_tail_dur = 0.0
+        prev_tail_has_audio = False
 
         if enable_intro:
             if progress_fn:
@@ -2669,12 +3476,12 @@ def run_autocut_pipeline(
                 if _extract_last_frame_clip(
                     intro_mp4,
                     tail_path,
-                    trans_dur=trans_dur,
+                    trans_dur=INTRO_TAIL_SEC,
                     out_fps=out_fps,
                     video_bitrate_bps=video_bitrate_bps,
                     video_codec=video_codec,
                 ):
-                    prev_tail_mp4 = tail_path
+                    prev_tail_mp4, prev_tail_dur = tail_path, INTRO_TAIL_SEC
         else:
             release_aesthetic_vlm_engine()
 
@@ -2704,6 +3511,26 @@ def run_autocut_pipeline(
         total_cuts = len(flat_cuts)
         rng = random.Random(42)
         color_filter_cache: Dict[str, str] = {}
+        hdr_cache: Dict[str, Tuple[List[str], str]] = {}
+
+        # Plan every join up front: a cut has to know how the next one leaves it so it can render that
+        # much real footage past its out point (a "handle") for the dissolve and the audio crossfade.
+        trans_style = _transition_style_for(style_cfg)
+        plans: List[Tuple[str, float]] = []
+        for i, cut in enumerate(flat_cuts):
+            if not enable_transitions or (i == 0 and not enable_intro) or round(cut[2] - cut[1], 2) <= 1.2:
+                plans.append(("none", 0.0))
+            else:
+                plans.append(plan_transition(flat_cuts[i - 1] if i else None, cut, edit_mode, trans_style, trans_prob, rng))
+        plan_counts: Dict[str, int] = defaultdict(int)
+        for name, _ in plans:
+            plan_counts[TRANSITION_LABELS_KO.get(name, name)] += 1
+        log_fn(
+            f"🔀 상황별 트랜지션 계획 ({trans_style}): "
+            + ", ".join(f"{k} {v}" for k, v in sorted(plan_counts.items(), key=lambda kv: -kv[1]))
+            + f" · 컷마다 오디오 크로스페이드 {AUDIO_XFADE_SEC:.2f}초"
+        )
+        used_counts: Dict[str, int] = defaultdict(int)
 
         for cut_idx, (clip, s, e) in enumerate(flat_cuts, 1):
             if stop_check_fn and stop_check_fn():
@@ -2714,19 +3541,42 @@ def run_autocut_pipeline(
             ctype = clip.get("type", "video")
             dur = round(e - s, 2)
             is_last_cut = cut_idx == total_cuts
+            trans_in, td_in = plans[cut_idx - 1]
+            next_td = 0.0 if is_last_cut else plans[cut_idx][1]
 
+            hdr_hw_args: List[str] = []
+            decode_args: List[str] = ["-hwaccel", "auto"]
+            hdr_head = ""
             if ctype == "video":
                 if fpath not in color_filter_cache:
                     cf_str = get_color_profile_filter(color_profile, fpath, log_fn=log_fn)
                     color_filter_cache[fpath] = f",{cf_str}" if cf_str else ""
                 clip_eq_chain = color_filter_cache[fpath] + eq_chain
+                if fpath not in hdr_cache:
+                    dr = detect_dynamic_range(fpath)
+                    hdr_cache[fpath] = get_hdr_tonemap_vf(dr)
+                    if hdr_cache[fpath][1]:
+                        log_fn(f"  🌈 [{fname}] {dr['label']} HDR 감지 -> SDR(Rec.709) 톤매핑 적용")
+                hdr_hw_args, tm_vf = hdr_cache[fpath]
+                # Source-side filters before scaling: HDR tone map, then the manual timeline rotation
+                hdr_head = "".join(f"{f}," for f in (tm_vf, rotation_vf(clip.get("rotation", 0))) if f)
+                # "-hwaccel auto" with a Vulkan device present picks a decoder that yields solid-blue frames
+                # for 10-bit HLG/DV clips through libplacebo; software decode is correct and just as fast here
+                decode_args = [] if hdr_hw_args else ["-hwaccel", "auto"]
             else:
                 clip_eq_chain = eq_chain
 
-            use_tr = enable_transitions and prev_tail_mp4 and (rng.random() <= trans_prob)
-            chosen_trans = rng.choice(trans_pool) if use_tr else "none"
+            # Handle: real footage after this cut's out point, long enough for the next dissolve and the
+            # audio crossfade, limited by what the source still has (none for photos / the last cut)
+            handle = 0.0
+            if ctype == "video" and not is_last_cut:
+                available = float(clip.get("duration", 0.0) or 0.0) - e - 0.05
+                handle = round(min(max(next_td, AUDIO_XFADE_SEC), available), 3)
+                if handle < 0.1:
+                    handle = 0.0
+
             if progress_fn:
-                t_info = f" [전환: {chosen_trans}]" if chosen_trans != "none" else ""
+                t_info = f" [전환: {TRANSITION_LABELS_KO.get(trans_in, trans_in)}]" if trans_in != "none" else ""
                 progress_fn(
                     50.0 + (cut_idx / max(1, total_cuts)) * 38.0,
                     f"컷 렌더링 중 ({cut_idx}/{total_cuts}): {fname} ({s:.1f}s~{e:.1f}s){t_info}",
@@ -2734,6 +3584,7 @@ def run_autocut_pipeline(
 
             raw_seg = os.path.join(tmpdir, f"raw_{cut_idx:04d}.mp4")
             seg_out = os.path.join(tmpdir, f"seg_{cut_idx:04d}.mp4")
+            handle_seg = os.path.join(tmpdir, f"handle_{cut_idx:04d}.mp4")
 
             fade_out_v = ""
             fade_out_a = ""
@@ -2744,172 +3595,10 @@ def run_autocut_pipeline(
 
             bgm_ss = round(bgm_cursor % 145.0, 2)
             bgm_cursor += dur
+            has_bgm = bool(bgm_file and os.path.isfile(bgm_file))
 
             if ctype == "video":
-                if bgm_file and os.path.isfile(bgm_file):
-                    # Mix original denoised video audio (100%) with very low-volume BGM (bgm_video_vol, ~6%)
-                    if enable_hud and os.path.exists(hud_png):
-                        fc_str = (
-                            f"[0:v]{scale_pad_vf}{clip_eq_chain}[base];"
-                            f"[base][1:v]overlay=0:0:format=auto{fade_out_v},format=yuv420p[v];"
-                            f"[0:a]highpass=f=85,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[va];"
-                            f"[2:a]volume={bgm_video_vol:.3f},aresample=48000[ba];"
-                            f"[va][ba]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1:normalize=0{fade_out_a}[a]"
-                        )
-                        cmd_raw = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-hwaccel",
-                            "auto",
-                            "-ss",
-                            f"{s:.2f}",
-                            "-to",
-                            f"{e:.2f}",
-                            "-i",
-                            fpath,
-                            "-i",
-                            hud_png,
-                            "-stream_loop",
-                            "-1",
-                            "-ss",
-                            f"{bgm_ss:.2f}",
-                            "-t",
-                            f"{dur:.2f}",
-                            "-i",
-                            bgm_file,
-                            "-filter_complex",
-                            fc_str,
-                            "-map",
-                            "[v]",
-                            "-map",
-                            "[a]",
-                            *vcodec_args,
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-ar",
-                            "48000",
-                            "-ac",
-                            "2",
-                            raw_seg,
-                        ]
-                    else:
-                        fc_str = (
-                            f"[0:v]{scale_pad_vf}{clip_eq_chain}{fade_out_v},format=yuv420p[v];"
-                            f"[0:a]highpass=f=85,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[va];"
-                            f"[1:a]volume={bgm_video_vol:.3f},aresample=48000[ba];"
-                            f"[va][ba]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1:normalize=0{fade_out_a}[a]"
-                        )
-                        cmd_raw = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-hwaccel",
-                            "auto",
-                            "-ss",
-                            f"{s:.2f}",
-                            "-to",
-                            f"{e:.2f}",
-                            "-i",
-                            fpath,
-                            "-stream_loop",
-                            "-1",
-                            "-ss",
-                            f"{bgm_ss:.2f}",
-                            "-t",
-                            f"{dur:.2f}",
-                            "-i",
-                            bgm_file,
-                            "-filter_complex",
-                            fc_str,
-                            "-map",
-                            "[v]",
-                            "-map",
-                            "[a]",
-                            *vcodec_args,
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-ar",
-                            "48000",
-                            "-ac",
-                            "2",
-                            raw_seg,
-                        ]
-                else:
-                    if enable_hud and os.path.exists(hud_png):
-                        cmd_raw = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-hwaccel",
-                            "auto",
-                            "-ss",
-                            f"{s:.2f}",
-                            "-to",
-                            f"{e:.2f}",
-                            "-i",
-                            fpath,
-                            "-i",
-                            hud_png,
-                            "-filter_complex",
-                            f"[0:v]{scale_pad_vf}{clip_eq_chain}[base];[base][1:v]overlay=0:0:format=auto{fade_out_v},format=yuv420p[v]",
-                            "-map",
-                            "[v]",
-                            "-map",
-                            "0:a:0?",
-                            "-af",
-                            f"highpass=f=85,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11{fade_out_a}",
-                            *vcodec_args,
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-ar",
-                            "48000",
-                            "-ac",
-                            "2",
-                            raw_seg,
-                        ]
-                    else:
-                        cmd_raw = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-hwaccel",
-                            "auto",
-                            "-ss",
-                            f"{s:.2f}",
-                            "-to",
-                            f"{e:.2f}",
-                            "-i",
-                            fpath,
-                            "-map",
-                            "0:v:0",
-                            "-map",
-                            "0:a:0?",
-                            "-vf",
-                            f"{scale_pad_vf}{clip_eq_chain}{fade_out_v},format=yuv420p",
-                            "-af",
-                            f"highpass=f=85,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11{fade_out_a}",
-                            *vcodec_args,
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-ar",
-                            "48000",
-                            "-ac",
-                            "2",
-                            raw_seg,
-                        ]
+                src, pre_vf, post_vf, photo_bgm_af = fpath, hdr_head, clip_eq_chain, ""
             else:
                 # Photo segment: normalize orientation (EXIF + upright check + blurred frame) & play BGM at normal volume (bgm_photo_vol)
                 norm_photo = os.path.join(tmpdir, f"photo_norm_{cut_idx:04d}.jpg")
@@ -2919,204 +3608,72 @@ def run_autocut_pipeline(
                     cover_mode=False,
                     out_width=out_width,
                     out_height=out_height,
+                    manual_rotation=clip.get("rotation", 0),
                 )
-                photo_src = norm_photo if (ok_p and os.path.exists(norm_photo)) else fpath
-
+                src = norm_photo if (ok_p and os.path.exists(norm_photo)) else fpath
+                pre_vf, post_vf = "", eq_chain
                 photo_fade_end = max(0.2, round(dur - 0.35, 2))
                 photo_bgm_af = (
                     f"volume={bgm_photo_vol:.3f},afade=t=in:st=0:d=0.35,"
                     f"afade=t=out:st={photo_fade_end:.2f}:d=0.35{fade_out_a},aresample=48000"
                 )
 
-                if bgm_file and os.path.isfile(bgm_file):
-                    if enable_hud and os.path.exists(hud_png):
-                        cmd_raw = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-loop",
-                            "1",
-                            "-t",
-                            f"{dur:.2f}",
-                            "-i",
-                            photo_src,
-                            "-i",
-                            hud_png,
-                            "-stream_loop",
-                            "-1",
-                            "-ss",
-                            f"{bgm_ss:.2f}",
-                            "-t",
-                            f"{dur:.2f}",
-                            "-i",
-                            bgm_file,
-                            "-filter_complex",
-                            f"[0:v]{scale_pad_vf}{eq_chain}[base];[base][1:v]overlay=0:0:format=auto{fade_out_v},format=yuv420p[v]",
-                            "-map",
-                            "[v]",
-                            "-map",
-                            "2:a:0",
-                            "-af",
-                            photo_bgm_af,
-                            *vcodec_args,
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-ar",
-                            "48000",
-                            "-ac",
-                            "2",
-                            "-shortest",
-                            raw_seg,
-                        ]
-                    else:
-                        cmd_raw = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-loop",
-                            "1",
-                            "-t",
-                            f"{dur:.2f}",
-                            "-i",
-                            photo_src,
-                            "-stream_loop",
-                            "-1",
-                            "-ss",
-                            f"{bgm_ss:.2f}",
-                            "-t",
-                            f"{dur:.2f}",
-                            "-i",
-                            bgm_file,
-                            "-vf",
-                            f"{scale_pad_vf}{eq_chain}{fade_out_v},format=yuv420p",
-                            "-map",
-                            "0:v:0",
-                            "-map",
-                            "1:a:0",
-                            "-af",
-                            photo_bgm_af,
-                            *vcodec_args,
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-ar",
-                            "48000",
-                            "-ac",
-                            "2",
-                            "-shortest",
-                            raw_seg,
-                        ]
-                else:
-                    if enable_hud and os.path.exists(hud_png):
-                        cmd_raw = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-loop",
-                            "1",
-                            "-t",
-                            f"{dur:.2f}",
-                            "-i",
-                            photo_src,
-                            "-i",
-                            hud_png,
-                            "-f",
-                            "lavfi",
-                            "-t",
-                            f"{dur:.2f}",
-                            "-i",
-                            "anullsrc=channel_layout=stereo:sample_rate=48000",
-                            "-filter_complex",
-                            f"[0:v]{scale_pad_vf}{eq_chain}[base];[base][1:v]overlay=0:0:format=auto{fade_out_v},format=yuv420p[v]",
-                            "-map",
-                            "[v]",
-                            "-map",
-                            "2:a",
-                            *vcodec_args,
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-shortest",
-                            raw_seg,
-                        ]
-                    else:
-                        cmd_raw = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-loop",
-                            "1",
-                            "-t",
-                            f"{dur:.2f}",
-                            "-i",
-                            photo_src,
-                            "-f",
-                            "lavfi",
-                            "-t",
-                            f"{dur:.2f}",
-                            "-i",
-                            "anullsrc=channel_layout=stereo:sample_rate=48000",
-                            "-vf",
-                            f"{scale_pad_vf}{eq_chain}{fade_out_v},format=yuv420p",
-                            *vcodec_args,
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-shortest",
-                            raw_seg,
-                        ]
+            cmd_raw = _build_cut_render_cmd(
+                src=src,
+                is_photo=ctype != "video",
+                s=s,
+                dur=dur,
+                handle=handle,
+                pre_vf=pre_vf,
+                scale_pad_vf=scale_pad_vf,
+                post_vf=post_vf,
+                hud_png=hud_png if (enable_hud and os.path.exists(hud_png)) else "",
+                bgm_file=bgm_file if has_bgm else "",
+                bgm_ss=bgm_ss,
+                bgm_vol=bgm_video_vol,
+                photo_bgm_af=photo_bgm_af,
+                hw_args=hdr_hw_args,
+                decode_args=decode_args,
+                fade_out_v=fade_out_v,
+                fade_out_a=fade_out_a,
+                vcodec_args=vcodec_args,
+                out_main=raw_seg,
+                out_handle=handle_seg,
+            )
+            res = subprocess.run(cmd_raw, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            if res.returncode != 0:
+                err = res.stderr.decode("utf-8", "ignore").strip().splitlines()[-3:]
+                raise RuntimeError(f"컷 렌더링 실패 ({fname} {s:.1f}s~{e:.1f}s): {' / '.join(err)}")
 
-            subprocess.run(cmd_raw, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Join into the previous segment: dissolve out of its handle / still + audio crossfade
+            used, used_td, used_ax = _join_cut(
+                prev_tail_mp4 if (prev_tail_mp4 and os.path.exists(prev_tail_mp4)) else "",
+                prev_tail_dur,
+                prev_tail_has_audio,
+                raw_seg,
+                seg_out,
+                trans_in,
+                td_in,
+                vcodec_args,
+            )
+            used_counts[TRANSITION_LABELS_KO.get(used, used)] += 1
 
-            # Apply random xfade transition from previous clip's tail if enabled
-            if enable_transitions and prev_tail_mp4 and os.path.exists(prev_tail_mp4) and dur > 1.2:
-                cmd_xfade = [
-                    "ffmpeg",
-                    "-y",
-                    "-v",
-                    "error",
-                    "-i",
-                    prev_tail_mp4,
-                    "-i",
-                    raw_seg,
-                    "-filter_complex",
-                    f"[0:v][1:v]xfade=transition={chosen_trans}:duration={trans_dur:.2f}:offset=0,format=yuv420p[v]",
-                    "-map",
-                    "[v]",
-                    "-map",
-                    "1:a?",
-                    *vcodec_args,
-                    "-c:a",
-                    "copy",
-                    seg_out,
-                ]
-                res = subprocess.run(cmd_xfade, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if res.returncode != 0 or not os.path.exists(seg_out):
-                    shutil.copyfile(raw_seg, seg_out)
-            else:
-                shutil.copyfile(raw_seg, seg_out)
-
-            # Extract tail of raw_seg for the NEXT clip's transition
-            if enable_transitions and not is_last_cut:
-                next_tail = os.path.join(tmpdir, f"tail_{cut_idx:04d}.mp4")
-                if _extract_last_frame_clip(
-                    raw_seg,
-                    next_tail,
-                    trans_dur=trans_dur,
-                    out_fps=out_fps,
-                    video_bitrate_bps=video_bitrate_bps,
-                    video_codec=video_codec,
-                ):
-                    prev_tail_mp4 = next_tail
+            # Tail for the NEXT join
+            prev_tail_mp4, prev_tail_dur, prev_tail_has_audio = None, 0.0, False
+            if not is_last_cut:
+                if handle > 0 and os.path.exists(handle_seg):
+                    prev_tail_mp4, prev_tail_dur, prev_tail_has_audio = handle_seg, handle, True
+                elif plans[cut_idx][0] != "none":
+                    still_tail = os.path.join(tmpdir, f"tail_{cut_idx:04d}.mp4")
+                    if _extract_last_frame_clip(
+                        raw_seg,
+                        still_tail,
+                        trans_dur=max(0.2, next_td),
+                        out_fps=out_fps,
+                        video_bitrate_bps=video_bitrate_bps,
+                        video_codec=video_codec,
+                    ):
+                        prev_tail_mp4, prev_tail_dur = still_tail, max(0.2, next_td)
             try:
                 os.remove(raw_seg)
             except Exception:
@@ -3124,8 +3681,12 @@ def run_autocut_pipeline(
 
             seg_files.append(seg_out)
 
-        if is_last_cut:
-            log_fn("🎬 랜덤 클립 트랜지션 및 마지막 장면 블랙 페이드아웃 적용 완료")
+        if total_cuts:
+            log_fn(
+                "🎬 트랜지션 적용 완료 (실제 영상 겹침 디졸브 + 오디오 크로스페이드): "
+                + ", ".join(f"{k} {v}" for k, v in sorted(used_counts.items(), key=lambda kv: -kv[1]))
+                + " · 마지막 장면 블랙 페이드아웃"
+            )
 
         concat_txt = os.path.join(tmpdir, "concat_list.txt")
         with open(concat_txt, "w", encoding="utf-8") as f:

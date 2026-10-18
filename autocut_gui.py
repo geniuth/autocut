@@ -1,11 +1,13 @@
 import os
+import re
 import sys
+import json
 import glob
 import time
 import ctypes
 import threading
 import subprocess
-from collections import deque
+from collections import deque, defaultdict
 
 # 0. Ensure GUI always runs on the user's interactive 'WinSta0\Default' desktop
 if os.name == "nt":
@@ -87,6 +89,16 @@ from autocut_engine import (
     AUTOCUT_VERSION,
     DEFAULT_AI_MODELS,
 )
+from autocut_timeline import (
+    TimelinePanel,
+    load_manual_order,
+    load_clip_rotations,
+    read_timeline_file,
+    write_timeline_file,
+)
+
+SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "autocut_session.json")
+PROJECT_FILE_EXT = ".autocut.json"
 
 
 class _FILETIME(ctypes.Structure):
@@ -97,22 +109,201 @@ def _ft_to_int(ft: _FILETIME) -> int:
     return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
 
 
+class _DXGI_ADAPTER_DESC1(ctypes.Structure):
+    _fields_ = [
+        ("Description", ctypes.c_wchar * 128),
+        ("VendorId", ctypes.c_uint),
+        ("DeviceId", ctypes.c_uint),
+        ("SubSysId", ctypes.c_uint),
+        ("Revision", ctypes.c_uint),
+        ("DedicatedVideoMemory", ctypes.c_size_t),
+        ("DedicatedSystemMemory", ctypes.c_size_t),
+        ("SharedSystemMemory", ctypes.c_size_t),
+        ("LuidLow", ctypes.c_uint32),
+        ("LuidHigh", ctypes.c_int32),
+        ("Flags", ctypes.c_uint),
+    ]
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("d1", ctypes.c_uint32), ("d2", ctypes.c_uint16), ("d3", ctypes.c_uint16), ("d4", ctypes.c_ubyte * 8)]
+
+
+def _com_call(obj, index: int, restype, *argtypes):
+    vtbl = ctypes.cast(ctypes.cast(obj, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+    return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtbl[index])
+
+
+class _D3DKMT_ADAPTERINFO(ctypes.Structure):
+    _fields_ = [
+        ("hAdapter", ctypes.c_uint32),
+        ("LuidLow", ctypes.c_uint32),
+        ("LuidHigh", ctypes.c_int32),
+        ("NumOfSources", ctypes.c_uint32),
+        ("bPrecisePresentRegionsPreferred", ctypes.c_int32),
+    ]
+
+
+class _D3DKMT_ENUMADAPTERS2(ctypes.Structure):
+    _fields_ = [("NumAdapters", ctypes.c_uint32), ("pAdapters", ctypes.POINTER(_D3DKMT_ADAPTERINFO))]
+
+
+def _kernel_adapter_luid_order() -> list:
+    """LUIDs in the kernel's adapter order (what Task Manager numbers GPU 0, 1, ...)."""
+    gdi = ctypes.windll.gdi32
+    req = _D3DKMT_ENUMADAPTERS2(0, None)
+    if gdi.D3DKMTEnumAdapters2(ctypes.byref(req)) != 0 or not req.NumAdapters:
+        return []
+    arr = (_D3DKMT_ADAPTERINFO * req.NumAdapters)()
+    req.pAdapters = arr
+    if gdi.D3DKMTEnumAdapters2(ctypes.byref(req)) != 0:
+        return []
+    order = []
+    for a in arr[: req.NumAdapters]:
+        order.append(f"0x{a.LuidHigh & 0xFFFFFFFF:08x}_0x{a.LuidLow:08x}")
+        gdi.D3DKMTCloseAdapter(ctypes.byref(ctypes.c_uint32(a.hAdapter)))
+    return order
+
+
+def enumerate_gpu_adapters() -> list:
+    """
+    Display adapters numbered like Task Manager (GPU 0 = iGPU on Optimus laptops).
+    Names come from DXGI, but DXGI's own order is not used: once CUDA is loaded the NVIDIA Optimus
+    shim moves the dGPU to the front, so the order is taken from the kernel adapter list instead.
+    Returns [{name, vendor_id, luid ('0x........_0x........'), vram_mb, software}].
+    """
+    iid = _GUID(0x770AAE78, 0xF26F, 0x4DBA, (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87))
+    factory = ctypes.c_void_p()
+    if ctypes.windll.dxgi.CreateDXGIFactory1(ctypes.byref(iid), ctypes.byref(factory)) != 0:
+        return []
+    adapters = []
+    try:
+        idx = 0
+        while True:
+            ad = ctypes.c_void_p()
+            # IDXGIFactory1::EnumAdapters1 (vtable 12)
+            if _com_call(factory, 12, ctypes.c_long, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))(factory, idx, ctypes.byref(ad)) != 0:
+                break
+            desc = _DXGI_ADAPTER_DESC1()
+            _com_call(ad, 10, ctypes.c_long, ctypes.POINTER(_DXGI_ADAPTER_DESC1))(ad, ctypes.byref(desc))  # GetDesc1
+            _com_call(ad, 2, ctypes.c_ulong)(ad)  # Release
+            adapters.append(
+                {
+                    "name": desc.Description,
+                    "vendor_id": desc.VendorId,
+                    "luid": f"0x{desc.LuidHigh & 0xFFFFFFFF:08x}_0x{desc.LuidLow:08x}",
+                    "vram_mb": desc.DedicatedVideoMemory / (1024 * 1024),
+                    "software": bool(desc.Flags & 2),
+                }
+            )
+            idx += 1
+    finally:
+        _com_call(factory, 2, ctypes.c_ulong)(factory)
+    try:
+        kernel_order = _kernel_adapter_luid_order()
+    except Exception:
+        kernel_order = []
+    rank = {luid: i for i, luid in enumerate(kernel_order)}
+    adapters.sort(key=lambda a: (rank.get(a["luid"], len(rank)), int(a["luid"].replace("_0x", ""), 16)))
+    return adapters
+
+
+class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    _fields_ = [("CStatus", ctypes.c_uint32), ("doubleValue", ctypes.c_double)]
+
+
+class _PDH_FMT_COUNTERVALUE_ITEM_W(ctypes.Structure):
+    _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _PDH_FMT_COUNTERVALUE)]
+
+
+class _PdhGpuEngineCounter:
+    """Task-Manager-equivalent GPU/NPU utilization from the '\\GPU Engine(*)\\Utilization Percentage' counters."""
+
+    _RX = re.compile(r"luid_(0x[0-9a-f]+_0x[0-9a-f]+)_phys_(\d+)_eng_(\d+)_engtype_(.*)$", re.IGNORECASE)
+
+    def __init__(self):
+        self._pdh = ctypes.windll.pdh
+        self._pdh.PdhGetFormattedCounterArrayW.restype = ctypes.c_uint32
+        self._query = ctypes.c_void_p()
+        self._counter = ctypes.c_void_p()
+        if self._pdh.PdhOpenQueryW(None, 0, ctypes.byref(self._query)) != 0:
+            raise OSError("PdhOpenQueryW failed")
+        if self._pdh.PdhAddEnglishCounterW(
+            self._query, r"\GPU Engine(*)\Utilization Percentage", 0, ctypes.byref(self._counter)
+        ) != 0:
+            raise OSError("GPU Engine counters unavailable")
+        self._pdh.PdhCollectQueryData(self._query)
+
+    def sample(self):
+        """Return ({luid: busiest-engine %}, {luid: set(engine types)}) like Task Manager's per-GPU graph."""
+        self._pdh.PdhCollectQueryData(self._query)
+        size = ctypes.c_uint32(0)
+        count = ctypes.c_uint32(0)
+        fmt = 0x200 | 0x8000  # PDH_FMT_DOUBLE | PDH_FMT_NOCAP100
+        self._pdh.PdhGetFormattedCounterArrayW(self._counter, fmt, ctypes.byref(size), ctypes.byref(count), None)
+        if not size.value:
+            return {}, {}
+        buf = ctypes.create_string_buffer(size.value)
+        if self._pdh.PdhGetFormattedCounterArrayW(self._counter, fmt, ctypes.byref(size), ctypes.byref(count), buf) != 0:
+            return {}, {}
+        items = ctypes.cast(buf, ctypes.POINTER(_PDH_FMT_COUNTERVALUE_ITEM_W))
+        per_engine = defaultdict(float)
+        engtypes = defaultdict(set)
+        for i in range(count.value):
+            m = self._RX.search(items[i].szName or "")
+            if not m:
+                continue
+            luid = m.group(1).lower()
+            engtypes[luid].add(m.group(4).lower())
+            if items[i].FmtValue.CStatus <= 1:  # PDH_CSTATUS_VALID_DATA / NEW_DATA
+                per_engine[(luid, m.group(2), m.group(3))] += items[i].FmtValue.doubleValue
+        per_luid = {luid: 0.0 for luid in engtypes}
+        for (luid, _, _), val in per_engine.items():
+            per_luid[luid] = max(per_luid[luid], min(100.0, val))
+        return per_luid, engtypes
+
+
+def _short_gpu_name(name: str) -> str:
+    for a, b in (("NVIDIA GeForce ", ""), ("(R)", ""), ("(TM)", ""), (" Laptop GPU", ""), (" Graphics", "")):
+        name = name.replace(a, b)
+    return " ".join(name.split())
+
+
+SERIES_COLORS = {"cpu": "#89b4fa", "npu": "#cba6f7"}
+GPU_SERIES_COLORS = ["#fab387", "#a6e3a1", "#f5c2e7", "#94e2d5"]
+
+
 class SystemResourceMonitor:
     """
-    Zero-popup real-time CPU & NVIDIA GPU monitor:
+    Zero-popup real-time CPU / GPU0·GPU1 / NPU monitor:
     - CPU % via Windows kernel32.GetSystemTimes
-    - GPU % & VRAM via a single persistent 'nvidia-smi -l 1' background stream with CREATE_NO_WINDOW
+    - Every GPU (iGPU + NVIDIA) and the NPU via the Windows 'GPU Engine' performance counters (same numbers as
+      Task Manager, including NVENC/NVDEC engines), numbered in DXGI order like Task Manager's GPU 0 / GPU 1
+    - NVIDIA VRAM & NVENC % via a single persistent 'nvidia-smi -l 1' background stream with CREATE_NO_WINDOW
     """
 
     def __init__(self, history_len: int = 60):
         self.history_len = history_len
         self.cpu_history = deque([0.0] * history_len, maxlen=history_len)
-        self.gpu_history = deque([0.0] * history_len, maxlen=history_len)
         self.cpu_pct = 0.0
-        self.gpu_pct = 0.0
+
+        try:
+            all_adapters = enumerate_gpu_adapters()
+        except Exception:
+            all_adapters = []
+        self._known_luids = {a["luid"] for a in all_adapters}
+        self.gpus = [dict(a, short=_short_gpu_name(a["name"])) for a in all_adapters if not a["software"]]
+        self.gpu_pct = {g["luid"]: 0.0 for g in self.gpus}
+        self.gpu_history = {g["luid"]: deque([0.0] * history_len, maxlen=history_len) for g in self.gpus}
+        self.npu_luid = None
+        self.npu_pct = 0.0
+        self.npu_history = deque([0.0] * history_len, maxlen=history_len)
+
+        # NVIDIA-only extras from nvidia-smi
+        self.nv_util_smi = 0.0
+        self.nv_enc_pct = 0.0
         self.vram_used_mb = 0.0
         self.vram_total_mb = 8192.0
-        self.gpu_name = "NVIDIA GPU"
 
         self._prev_idle = 0
         self._prev_kernel = 0
@@ -120,8 +311,56 @@ class SystemResourceMonitor:
         self._running = True
         self._smi_proc = None
 
+        self._pdh = None
+        try:
+            self._pdh = _PdhGpuEngineCounter()
+            _, engtypes = self._pdh.sample()
+            self._discover_npu(engtypes)
+        except Exception:
+            self._pdh = None
+
         self._init_cpu_times()
         self._start_gpu_stream()
+        if self._pdh is not None:
+            threading.Thread(target=self._pdh_loop, daemon=True).start()
+
+    def _discover_npu(self, engtypes):
+        """The NPU is a compute-only WDDM/MCDM device: it has GPU Engine counters but no DXGI adapter."""
+        if self.npu_luid:
+            return
+        for luid, types in engtypes.items():
+            if luid not in self._known_luids and types and types <= {"compute", ""}:
+                self.npu_luid = luid
+                return
+
+    def _pdh_loop(self):
+        while self._running:
+            time.sleep(1.0)
+            try:
+                per_luid, engtypes = self._pdh.sample()
+            except Exception:
+                continue
+            self._discover_npu(engtypes)
+            for g in self.gpus:
+                self.gpu_pct[g["luid"]] = per_luid.get(g["luid"], 0.0)
+            if self.npu_luid:
+                self.npu_pct = per_luid.get(self.npu_luid, 0.0)
+
+    def series(self) -> list:
+        """[(key, legend text, color, history)] for every monitored device."""
+        out = [("cpu", f"● CPU {self.cpu_pct:.0f}%", SERIES_COLORS["cpu"], self.cpu_history)]
+        for idx, g in enumerate(self.gpus):
+            pct = self.gpu_pct[g["luid"]]
+            txt = f"● GPU{idx} {g['short']} {pct:.0f}%"
+            if g["vendor_id"] == 0x10DE:
+                txt += (
+                    f" (NVENC {self.nv_enc_pct:.0f}% · "
+                    f"{self.vram_used_mb / 1024:.1f}/{self.vram_total_mb / 1024:.0f}GB)"
+                )
+            out.append((g["luid"], txt, GPU_SERIES_COLORS[idx % len(GPU_SERIES_COLORS)], self.gpu_history[g["luid"]]))
+        if self.npu_luid:
+            out.append(("npu", f"● NPU {self.npu_pct:.0f}%", SERIES_COLORS["npu"], self.npu_history))
+        return out
 
     def _init_cpu_times(self):
         idle, kernel, user = _FILETIME(), _FILETIME(), _FILETIME()
@@ -151,7 +390,7 @@ class SystemResourceMonitor:
                 flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
                 cmd = [
                     "nvidia-smi",
-                    "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+                    "--query-gpu=utilization.gpu,utilization.encoder,memory.used,memory.total",
                     "--format=csv,noheader,nounits",
                     "-l",
                     "1",
@@ -170,10 +409,18 @@ class SystemResourceMonitor:
                         break
                     parts = [p.strip() for p in line.strip().split(",")]
                     if len(parts) >= 4:
-                        self.gpu_name = parts[0].replace("NVIDIA GeForce ", "")
-                        self.gpu_pct = float(parts[1])
-                        self.vram_used_mb = float(parts[2])
-                        self.vram_total_mb = max(1.0, float(parts[3]))
+                        try:
+                            self.nv_util_smi = float(parts[0])
+                            self.nv_enc_pct = float(parts[1])
+                            self.vram_used_mb = float(parts[2])
+                            self.vram_total_mb = max(1.0, float(parts[3]))
+                        except ValueError:
+                            continue
+                        if self._pdh is None:
+                            # No perf counters: fall back to nvidia-smi for the NVIDIA GPU (encoder load included)
+                            for g in self.gpus:
+                                if g["vendor_id"] == 0x10DE:
+                                    self.gpu_pct[g["luid"]] = max(self.nv_util_smi, self.nv_enc_pct)
             except Exception:
                 pass
 
@@ -181,7 +428,9 @@ class SystemResourceMonitor:
 
     def sample_all(self):
         self.sample_cpu()
-        self.gpu_history.append(self.gpu_pct)
+        for g in self.gpus:
+            self.gpu_history[g["luid"]].append(self.gpu_pct[g["luid"]])
+        self.npu_history.append(self.npu_pct)
 
     def stop(self):
         self._running = False
@@ -232,7 +481,7 @@ def create_premiere_splash_image(width: int = 820, height: int = 460) -> Image.I
 
     draw.text((56, 172), "★  스마트 비전/모션 컷편집 & 베스트 샷 인트로 생성", font=font_desc, fill=(225, 230, 250, 255))
     draw.text((56, 206), "★  유튜브 URL 스타일 학습기 & 장르별 편집 프리셋 탑재", font=font_desc, fill=(225, 230, 250, 255))
-    draw.text((56, 240), "★  클립 간 랜덤 트랜지션 & 필모라(Filmora) 완벽 호환", font=font_desc, fill=(225, 230, 250, 255))
+    draw.text((56, 240), "★  상황별 트랜지션 · 오디오 크로스페이드 & 필모라 호환", font=font_desc, fill=(225, 230, 250, 255))
     draw.text((56, 274), "★  NVIDIA GeForce RTX CUDA & NVENC 하드웨어 가속", font=font_desc, fill=(225, 230, 250, 255))
 
     draw.rounded_rectangle([54, 322, 415, 362], radius=10, fill=(40, 36, 72, 255), outline=(249, 226, 175, 255), width=2)
@@ -310,8 +559,6 @@ class AutoCutStudioApp(tk.Tk):
 
         self.progress_var = tk.DoubleVar(value=0.0)
         self.status_var = tk.StringVar(value="준비 완료 — 날짜 폴더를 확인하고 [자동 컷편집 시작]을 눌러주세요.")
-        self.cpu_label_var = tk.StringVar(value="CPU: 0.0%")
-        self.gpu_label_var = tk.StringVar(value="GPU: 0.0% | VRAM: 0.0 / 8.0 GB")
         self.folder_summary_var = tk.StringVar(value="폴더 스캔 중...")
 
         self._stop_requested = False
@@ -328,7 +575,17 @@ class AutoCutStudioApp(tk.Tk):
         self._build_custom_indicator_icons()
         self._build_menubar()
         self._build_ui()
+        session = self._read_state_file(SESSION_FILE)
+        if session:
+            self._apply_settings(session.get("settings", {}))
         self.refresh_date_folders(manual=False)
+        if session:
+            self._restore_selection(session)
+            self.log(f"💾 이전 작업 상태를 복원했습니다 ({session.get('saved_at', '').replace('T', ' ')} 저장)")
+        self._session_save_job = None
+        for var in self._state_vars().values():
+            var.trace_add("write", lambda *_: self._schedule_session_save())
+        self.bind("<Control-s>", lambda e: self.save_session(manual=True))
         self._show_splash_and_launch()
 
     def _build_custom_indicator_icons(self):
@@ -460,6 +717,10 @@ class AutoCutStudioApp(tk.Tk):
         folder_menu = tk.Menu(menubar, tearoff=0, font=("맑은 고딕", 10))
         folder_menu.add_command(label="🔄 폴더 및 영상/사진 개수 새로고침 (F5)", command=lambda: self.refresh_date_folders(manual=True))
         folder_menu.add_separator()
+        folder_menu.add_command(label="💾 작업 상태 저장 (Ctrl+S)", command=lambda: self.save_session(manual=True))
+        folder_menu.add_command(label="💾 작업 파일로 내보내기 (설정 + 타임라인)...", command=self.export_project_file)
+        folder_menu.add_command(label="📂 작업 파일 불러오기...", command=self.import_project_file)
+        folder_menu.add_separator()
         folder_menu.add_command(label="📂 편집 결과 폴더 열기", command=self.open_output_folder)
         folder_menu.add_command(label="📂 원본 작업 폴더 열기", command=self.open_source_folder)
         folder_menu.add_separator()
@@ -547,8 +808,172 @@ class AutoCutStudioApp(tk.Tk):
         self.after(150, lambda: _animate_step(0))
 
     def _on_close(self):
+        self.save_session()
         self.monitor.stop()
         self.destroy()
+
+    # ── Work state: auto session + exportable project file ───────────────────
+    def _state_vars(self) -> dict:
+        return {
+            "target_dir": self.target_dir,
+            "edit_mode": self.edit_mode,
+            "whisper_model": self.whisper_model,
+            "denoise_audio": self.denoise_audio,
+            "include_scene_captions": self.include_scene_captions,
+            "burn_subtitles": self.burn_subtitles,
+            "export_filmora_clean": self.export_filmora_clean,
+            "include_photos": self.include_photos,
+            "enable_intro": self.enable_intro,
+            "intro_style": self.intro_style_var,
+            "intro_title": self.intro_title,
+            "enable_hud": self.enable_hud,
+            "logo_text": self.logo_text,
+            "enable_transitions": self.enable_transitions,
+            "enable_bgm": self.enable_bgm,
+            "custom_bgm_path": self.custom_bgm_path,
+            "auto_open_folder_on_done": self.auto_open_folder_on_done,
+            "out_resolution": self.out_resolution_var,
+            "out_fps": self.out_fps_var,
+            "out_bitrate_bps": self.out_bitrate_bps_var,
+            "out_codec": self.out_codec_var,
+            "color_profile": self.color_profile_var,
+            "style_preset": self.style_preset_var,
+            "yt_url": self.yt_url_var,
+        }
+
+    def collect_state(self, include_timelines: bool = False) -> dict:
+        sel = self.date_listbox.curselection()
+        state = {
+            "app": "AutoCut Studio 2026",
+            "version": AUTOCUT_VERSION,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "settings": {k: v.get() for k, v in self._state_vars().items()},
+            "selected_folders": [os.path.basename(self._date_folders[i]) for i in sel if i < len(self._date_folders)],
+            "active_folder": os.path.basename(self.timeline.folder) if self.timeline.folder else "",
+        }
+        if include_timelines:
+            # Order / device time corrections / rotations of every date folder, so the file is self-contained
+            timelines = {}
+            for folder in self._date_folders:
+                data = read_timeline_file(folder, self._output_dir_for(folder))
+                if data:
+                    timelines[os.path.basename(folder)] = data
+            state["timelines"] = timelines
+        return state
+
+    @staticmethod
+    def _read_state_file(path: str):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _write_state_file(path: str, state: dict):
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)  # atomic: a crash mid-write never leaves a half-written state file
+
+    def _apply_settings(self, settings: dict):
+        valid_choices = {
+            "intro_style": set(INTRO_STYLE_PRESETS),
+            "color_profile": set(COLOR_PROFILE_PRESETS),
+            "style_preset": set(self.all_presets),
+        }
+        for key, var in self._state_vars().items():
+            if key not in settings:
+                continue
+            val = settings[key]
+            if key in valid_choices and val not in valid_choices[key]:
+                continue  # preset renamed/removed since the state was saved
+            try:
+                var.set(val)
+            except Exception:
+                pass
+        self.style_desc_var.set(self.all_presets.get(self.style_preset_var.get(), {}).get("desc", ""))
+
+    def _restore_selection(self, state: dict):
+        names = set(state.get("selected_folders") or [])
+        if not names:
+            return
+        idx_by_name = {os.path.basename(p): i for i, p in enumerate(self._date_folders)}
+        hits = [idx_by_name[n] for n in names if n in idx_by_name]
+        if not hits:
+            return
+        self.date_listbox.selection_clear(0, tk.END)
+        for i in hits:
+            self.date_listbox.selection_set(i)
+        active = idx_by_name.get(state.get("active_folder", ""), hits[0])
+        self.date_listbox.activate(active)
+        self.date_listbox.see(active)
+        self._sync_timeline(force=True)
+
+    def _schedule_session_save(self):
+        if getattr(self, "_session_save_job", None):
+            self.after_cancel(self._session_save_job)
+        self._session_save_job = self.after(1500, self.save_session)
+
+    def save_session(self, manual: bool = False):
+        self._session_save_job = None
+        try:
+            self._write_state_file(SESSION_FILE, self.collect_state())
+            if manual:
+                self.status_var.set(f"💾 작업 상태 저장 완료 — {time.strftime('%H:%M:%S')} (다음 실행 시 자동 복원)")
+                self.log("💾 작업 상태(설정·선택 폴더)를 저장했습니다. 타임라인 순서·회전·시간 보정은 폴더별로 이미 저장되어 있습니다.")
+        except Exception as e:
+            if manual:
+                self.log(f"⚠️ 작업 상태 저장 실패: {e}")
+
+    def export_project_file(self):
+        base = self.target_dir.get().strip()
+        fp = filedialog.asksaveasfilename(
+            title="작업 파일로 저장",
+            initialdir=base if os.path.isdir(base) else None,
+            initialfile=f"{os.path.basename(base.rstrip(os.sep)) or 'autocut'}{PROJECT_FILE_EXT}",
+            defaultextension=PROJECT_FILE_EXT,
+            filetypes=[("AutoCut 작업 파일", f"*{PROJECT_FILE_EXT}"), ("JSON", "*.json")],
+        )
+        if not fp:
+            return
+        try:
+            state = self.collect_state(include_timelines=True)
+            self._write_state_file(fp, state)
+            self.log(f"💾 작업 파일 저장: {fp} (설정 + 타임라인 {len(state['timelines'])}개 폴더)")
+            self.status_var.set(f"💾 작업 파일 저장 완료: {os.path.basename(fp)}")
+        except Exception as e:
+            messagebox.showerror("저장 실패", f"작업 파일을 저장하지 못했습니다:\n{e}")
+
+    def import_project_file(self):
+        fp = filedialog.askopenfilename(
+            title="작업 파일 불러오기",
+            filetypes=[("AutoCut 작업 파일", f"*{PROJECT_FILE_EXT}"), ("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not fp:
+            return
+        state = self._read_state_file(fp)
+        if not state or "settings" not in state:
+            messagebox.showerror("불러오기 실패", "AutoCut 작업 파일이 아니거나 손상되었습니다.")
+            return
+        self._apply_settings(state["settings"])
+        self.refresh_date_folders(manual=False)
+        restored = 0
+        by_name = {os.path.basename(p): p for p in self._date_folders}
+        for name, data in (state.get("timelines") or {}).items():
+            folder = by_name.get(name)
+            if folder and isinstance(data, dict):
+                try:
+                    write_timeline_file(folder, self._output_dir_for(folder), data)
+                    restored += 1
+                except Exception as e:
+                    self.log(f"⚠️ [{name}] 타임라인 복원 실패: {e}")
+        self._restore_selection(state)
+        self._sync_timeline(force=True)
+        self.save_session()
+        self.log(f"📂 작업 파일 불러오기 완료: {os.path.basename(fp)} (설정 + 타임라인 {restored}개 폴더 복원)")
+        self.status_var.set(f"📂 작업 파일 불러옴: {os.path.basename(fp)}")
 
     def _build_ui(self):
         f_family = "맑은 고딕"
@@ -658,8 +1083,10 @@ class AutoCutStudioApp(tk.Tk):
             background=bg_main,
         ).pack(side=tk.RIGHT)
 
+        ai_row = ttk.Frame(main)
+        ai_row.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(
-            main,
+            ai_row,
             text=(
                 f"🤖 AI 엔진: {DEFAULT_AI_MODELS['stt']}  ·  CLIP Aesthetic (LAION V2.5)  ·  "
                 f"{DEFAULT_AI_MODELS['shot_detector']}  ·  {DEFAULT_AI_MODELS['vlm']}"
@@ -667,7 +1094,27 @@ class AutoCutStudioApp(tk.Tk):
             font=(f_family, 9),
             foreground="#7f849c",
             background=bg_main,
-        ).pack(fill=tk.X, anchor="w", pady=(0, 6))
+        ).pack(side=tk.LEFT)
+        self.vlm_status_var = tk.StringVar(value="🦙 Ollama 확인 중...")
+        self.vlm_status_lbl = tk.Label(
+            ai_row, textvariable=self.vlm_status_var, font=(f_family, 9, "bold"), fg="#7f849c", bg=bg_main
+        )
+        self.vlm_status_lbl.pack(side=tk.LEFT, padx=(14, 0))
+
+        def _check_vlm():
+            try:
+                from autocut_engine import detect_ollama_vlm_model
+
+                name = detect_ollama_vlm_model(log_fn=lambda _m: None)
+            except Exception:
+                name = None
+            if name:
+                txt, color = f"🦙 Ollama 연결됨: {name}", "#a6e3a1"
+            else:
+                txt, color = "🦙 Ollama 미연결 (CLIP 장면 분류로 대체)", "#f38ba8"
+            self.after(0, lambda: (self.vlm_status_var.set(txt), self.vlm_status_lbl.configure(fg=color)))
+
+        threading.Thread(target=_check_vlm, daemon=True).start()
 
         folder_card = tk.Frame(main, bg=bg_card, highlightthickness=1, highlightbackground="#313244", padx=14, pady=9)
         folder_card.pack(fill=tk.X, pady=(0, 12))
@@ -733,6 +1180,7 @@ class AutoCutStudioApp(tk.Tk):
             activestyle="none",
         )
         scrollbar.config(command=self.date_listbox.yview)
+        self.date_listbox.bind("<<ListboxSelect>>", lambda e: self._sync_timeline())
         self.date_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -822,7 +1270,7 @@ class AutoCutStudioApp(tk.Tk):
         chk_list = [
             ("베스트 샷 3초 인트로 생성 (선택한 인트로 디자인 적용)", self.enable_intro),
             ("좌측 상단 촬영 날짜 · 우측 상단 로고 상시 표시", self.enable_hud),
-            ("클립 간 랜덤 트랜지션 효과 + 마지막 페이드아웃", self.enable_transitions),
+            ("상황별 트랜지션(실제 영상 겹침) + 마지막 페이드아웃", self.enable_transitions),
             ("잔잔한 무료 배경음악(BGM) 자동 볼륨 조절 믹싱", self.enable_bgm),
             ("주행·바람 노이즈 제거 및 AI 한국어 음성 자막", self.denoise_audio),
             ("자막 완성본 + 필모라(Filmora)용 무자막 동시 생성", self.burn_subtitles),
@@ -952,24 +1400,26 @@ class AutoCutStudioApp(tk.Tk):
         ttk.Button(yt_btns, text="샘플 파일 선택...", command=self.browse_reference_video).pack(side=tk.LEFT)
 
         # ── Bottom Split Area: Monitor Graph (Left) + Real-time Log (Right) ──
+        # (packed last, after the timeline and footer, so it is the area that shrinks on small screens)
         bot_split = ttk.Frame(main)
-        bot_split.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        bot_split.columnconfigure(0, weight=4)
-        bot_split.columnconfigure(1, weight=6)
+        bot_split.columnconfigure(0, weight=5)
+        bot_split.columnconfigure(1, weight=5)
         bot_split.rowconfigure(0, weight=1)
 
         mon_card = tk.Frame(bot_split, bg=bg_card, highlightthickness=1, highlightbackground="#313244", padx=14, pady=10)
         mon_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
+        # Title and per-device legend share one row so the graph keeps its height on small screens
         mon_header = ttk.Frame(mon_card, style="Card.TFrame")
         mon_header.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(mon_header, text="📊 하드웨어 가속 모니터", style="SubHeader.TLabel").pack(side=tk.LEFT)
-        ttk.Label(mon_header, textvariable=self.gpu_label_var, style="GPU.TLabel").pack(side=tk.RIGHT, padx=(12, 0))
-        ttk.Label(mon_header, textvariable=self.cpu_label_var, style="CPU.TLabel").pack(side=tk.RIGHT)
+        ttk.Label(mon_header, text="📊 하드웨어", style="SubHeader.TLabel").pack(side=tk.LEFT, padx=(0, 10))
+        self.mon_legend = tk.Frame(mon_header, bg=bg_card)
+        self.mon_legend.pack(side=tk.LEFT, fill=tk.X)
+        self._legend_labels = {}
 
         self.graph_canvas = tk.Canvas(
             mon_card,
-            height=110,
+            height=90,
             bg="#14141f",
             highlightthickness=1,
             highlightbackground="#45475a",
@@ -1004,7 +1454,13 @@ class AutoCutStudioApp(tk.Tk):
 
         # ── Footer Progress Bar & Action Buttons ─────────────────────────────
         footer = ttk.Frame(main)
-        footer.pack(fill=tk.X)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # ── Premiere-style clip timeline (just above the footer) ─────────────
+        self.timeline = TimelinePanel(main, log_fn=self.log, bg=bg_card, font_family=f_family)
+        self.timeline.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
+        self.include_photos.trace_add("write", lambda *_: self._sync_timeline(force=True))
+        bot_split.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
         prog_row = ttk.Frame(footer)
         prog_row.pack(fill=tk.X, pady=(0, 8))
@@ -1099,13 +1555,13 @@ class AutoCutStudioApp(tk.Tk):
         if not self.winfo_exists():
             return
         self.monitor.sample_all()
-        cpu = self.monitor.cpu_pct
-        gpu = self.monitor.gpu_pct
-        v_used = self.monitor.vram_used_mb / 1024.0
-        v_tot = self.monitor.vram_total_mb / 1024.0
-
-        self.cpu_label_var.set(f"● CPU 사용률: {cpu:4.1f}%")
-        self.gpu_label_var.set(f"● GPU ({self.monitor.gpu_name}): {gpu:4.1f}%  |  VRAM: {v_used:.1f} / {v_tot:.1f} GB")
+        for key, text, color, _ in self.monitor.series():
+            lbl = self._legend_labels.get(key)
+            if lbl is None:
+                lbl = tk.Label(self.mon_legend, bg="#242436", fg=color, font=("맑은 고딕", 9, "bold"), anchor="w")
+                lbl.pack(side=tk.LEFT, padx=(0, 10))
+                self._legend_labels[key] = lbl
+            lbl.configure(text=text)
 
         self._draw_resource_graph()
 
@@ -1150,7 +1606,8 @@ class AutoCutStudioApp(tk.Tk):
         if w < 50 or h < 30:
             return
 
-        pad_l, pad_r, pad_t, pad_b = 46, 14, 10, 10
+        k = max(1.0, float(self.tk.call("tk", "scaling")) * 72.0 / 96.0)  # canvas is raw pixels, fonts follow DPI
+        pad_l, pad_r, pad_t, pad_b = int(34 * k), int(8 * k), int(6 * k), int(6 * k)
         plot_w = max(10, w - pad_l - pad_r)
         plot_h = max(10, h - pad_t - pad_b)
 
@@ -1171,8 +1628,8 @@ class AutoCutStudioApp(tk.Tk):
             if len(pts) >= 4:
                 c.create_line(*pts, fill=color, width=width, smooth=True)
 
-        draw_series(self.monitor.cpu_history, "#89b4fa", width=2)
-        draw_series(self.monitor.gpu_history, "#a6e3a1", width=2)
+        for _, _, color, history in self.monitor.series():
+            draw_series(history, color, width=2)
 
     def log(self, msg: str):
         self.log_text.configure(state=tk.NORMAL)
@@ -1251,6 +1708,7 @@ class AutoCutStudioApp(tk.Tk):
                     restored = True
         if not restored and self.date_listbox.size() > 0:
             self.date_listbox.selection_set(0)
+        self._sync_timeline(force=manual or auto_triggered)
 
         if manual:
             detail_str = ", ".join(folder_summaries) if folder_summaries else "미디어 없음"
@@ -1261,10 +1719,27 @@ class AutoCutStudioApp(tk.Tk):
             self.log(f"🔄 [폴더 변경 자동 감지] 파일 추가/삭제가 반영되어 개수가 갱신되었습니다 -> {detail_str}")
             self.status_var.set(f"폴더 변경 감지됨 — 총 영상 {total_v}개, 사진 {total_p}개로 자동 새로고침 완료!")
 
+    def _output_dir_for(self, folder_path: str) -> str:
+        return os.path.join(self.target_dir.get().strip(), f"편집결과_{os.path.basename(folder_path)}")
+
+    def _sync_timeline(self, force: bool = False):
+        """Show the active (last clicked) selected date folder on the timeline."""
+        sel = self.date_listbox.curselection()
+        if not sel:
+            return
+        active = self.date_listbox.index(tk.ACTIVE)
+        idx = active if active in sel else sel[0]
+        if 0 <= idx < len(self._date_folders):
+            folder = self._date_folders[idx]
+            self.timeline.load_folder(folder, self._output_dir_for(folder), self.include_photos.get(), force=force)
+            self._schedule_session_save()
+
     def select_first_day(self):
         self.date_listbox.selection_clear(0, tk.END)
         if self.date_listbox.size() > 0:
             self.date_listbox.selection_set(0)
+            self.date_listbox.activate(0)
+            self._sync_timeline()
 
     def select_all_days(self):
         if self.date_listbox.size() > 0:
@@ -1438,6 +1913,8 @@ class AutoCutStudioApp(tk.Tk):
                 date_name = os.path.basename(folder_path)
                 out_dir = os.path.join(base_dir, f"편집결과_{date_name}")
                 self._last_output_dir = out_dir
+                manual_order = load_manual_order(folder_path, out_dir)
+                clip_rotations = load_clip_rotations(folder_path, out_dir)
 
                 self.after(0, self.log, f"\n==========================================")
                 self.after(0, self.log, f"🎬 [{idx}/{len(selected_paths)}] {date_name} 자동 편집 시작")
@@ -1468,6 +1945,8 @@ class AutoCutStudioApp(tk.Tk):
                     out_fps=out_fps,
                     video_bitrate_bps=bitrate_bps,
                     video_codec=v_codec,
+                    manual_order=manual_order,
+                    clip_rotations=clip_rotations,
                     log_fn=lambda m: self.after(0, self.log, m),
                     progress_fn=lambda p, s: self.after(0, self.update_progress, p, s),
                     stop_check_fn=lambda: self._stop_requested,

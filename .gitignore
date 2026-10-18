@@ -11,3 +11,5 @@ output/
 test_full_jeju.py
 test_one_day.py
 run_classification.py
+autocut_session.json
+autocut_session.json.tmp

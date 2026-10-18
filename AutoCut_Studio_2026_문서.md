@@ -10,7 +10,9 @@
 | 파일 / 폴더 | 역할 및 설명 |
 | :--- | :--- |
 | [`autocut_gui.py`](file:///d:/workspace/autocut/autocut_gui.py) | **메인 데스크톱 GUI 애플리케이션** (`1920x1080` 풀HD 다크 스튜디오 테마, 프리미어 스타일 스플래시 화면, 3단 카드형 UI, 실시간 CPU/GPU/VRAM 모니터 그래프, 유튜브 URL 학습기) |
-| [`autocut_engine.py`](file:///d:/workspace/autocut/autocut_engine.py) | **핵심 AI 편집 엔진** (날짜별 분류, 메타데이터 시간순 정렬, OpenCV 비전/모션 스코어링, Faster-Whisper 한국어 STT, 베스트 샷 인트로 생성, 동적 BGM 더킹, FFmpeg HEVC NVENC 렌더링) |
+| [`autocut_engine.py`](file:///d:/workspace/autocut/autocut_engine.py) | **핵심 AI 편집 엔진** (날짜별 분류, 메타데이터 시간순 정렬, OpenCV 비전/모션 스코어링, Faster-Whisper 한국어 STT, 베스트 샷 인트로 생성, 동적 BGM 더킹, HDR→SDR 톤매핑, 상황별 트랜지션·오디오 크로스페이드, FFmpeg HEVC NVENC 렌더링) |
+| [`autocut_timeline.py`](file:///d:/workspace/autocut/autocut_timeline.py) | **프리미어식 하단 타임라인** (썸네일 클립 배치, 드래그 순서 변경, 기기 시간 보정, 클립 회전, `편집결과_<날짜>/<날짜>_타임라인순서.json` 저장) |
+| `autocut_session.json` (자동 생성, git 제외) | 마지막 작업 상태(설정·선택 폴더) — 다음 실행 때 자동 복원 |
 | [`AutoCut_Studio.vbs`](file:///d:/workspace/autocut/AutoCut_Studio.vbs) | **무콘솔(Windowless) 백그라운드 런처** (검은색 `cmd` 창 없이 즉시 GUI만 깔끔하게 실행) |
 | [`AutoCut_Studio.bat`](file:///d:/workspace/autocut/AutoCut_Studio.bat) | 배치 파일 실행 런처 (`AutoCut_Studio.vbs` 호출) |
 | [`custom_styles.json`](file:///d:/workspace/autocut/custom_styles.json) | 유튜브 URL 또는 로컬 레퍼런스 영상을 분석해 학습된 **맞춤형 편집 스타일 프리셋** 저장소 |
@@ -23,14 +25,14 @@
 ```mermaid
 flowchart TD
     A["📂 원본 미디어 폴더 (고프로 MP4 + 아이폰 MOV/JPG)"] --> B["📅 1. 날짜별 자동 분류 (classify_media_by_date)"]
-    B --> C["🕒 2. 메타데이터 촬영 시각 추출 및 시간순 교차 정렬"]
+    B --> C["🕒 2. 메타데이터 촬영 시각 추출 및 시간순 교차 정렬<br/>(타임라인에서 순서·기기 시간·회전 수동 조정)"]
     C --> D["🧠 3. AI 멀티모달 분석 (스마트 캐시 지원)"]
     D --> D1["🎙️ FFT 노이즈 제거 + Faster-Whisper 한국어 음성인식(STT)"]
     D --> D2["👁️ OpenCV 키프레임 비전 분석 (얼굴 검출 · 선명도 · 색감 · 흔들림 감점)"]
     D1 & D2 --> E["✂️ 4. 편집 모드별 최적 컷 구간 선택 (일반 8~12분 / 하이라이트 3~5분)"]
     E --> F["🌟 5. 정방향 베스트 샷 추출 & 3초 인트로 생성 (반투명 타이틀 + 하얀 테두리)"]
-    F --> G["🎵 6. 클립별 렌더링 + 상단 날짜/로고 HUD + 동적 BGM 믹싱 (영상 6% / 사진 38%)"]
-    G --> H["✨ 7. 랜덤 xfade 트랜지션 합성 + 마지막 클립 블랙 페이드아웃"]
+    F --> G["🎵 6. 클립별 렌더링 (HDR 톤매핑·회전) + 상단 날짜/로고 HUD + 동적 BGM 믹싱 (영상 6% / 사진 38%)"]
+    G --> H["✨ 7. 상황별 xfade 트랜지션 (실제 영상 겹침) + 오디오 크로스페이드 + 마지막 블랙 페이드아웃"]
     H --> I["🎬 8. 최종 출력 (HEVC H.265 NVENC / 지정 해상도·FPS·bps)"]
     I --> O1["✅ 자막 포함 완성본 MP4"]
     I --> O2["✅ 필모라(Filmora) 연동용 무자막 MP4 + 전체/음성 SRT 자막"]
@@ -72,6 +74,10 @@ flowchart TD
   * 해당 날짜의 모든 영상·사진 중 가장 선명하고 얼굴이 잘 나온 베스트 샷을 뽑아 **바깥쪽 하얀 액자 테두리**와 **은은한 반투명 중앙 타이틀 박스**(예: `윰탱이네 제주도 여행`, 불필요한 영문 배지 제거)를 합성하여 3초 인트로 영상으로 만듭니다.
 * **상단 날짜 · 로고 상시 표시 ([`create_hud_overlay_png`](file:///d:/workspace/autocut/autocut_engine.py#L945-L1032))**:
   * 좌측 상단에는 촬영 날짜(`📅 2023-09-21`), 우측 상단에는 가족 로고(`★ 윰탱해윤해진이네`)를 깔끔한 반투명 배지로 표시합니다.
+* **클립 수동 회전 (`rotation_vf`, v2.4.0)**:
+  * 옆으로·거꾸로 찍힌 클립은 타임라인에서 `R` / `Shift+R` / 우클릭(180°)으로 돌립니다. 영상은 `transpose`, 사진은 회전 후 블러 배경을 다시 만들며, 수동 회전한 클립은 자동 상하반전 보정을 건너뜁니다.
+* **HDR 자동 감지 & SDR 톤매핑 (`detect_dynamic_range`, `get_hdr_tonemap_vf`, v2.3.0)**:
+  * HLG(아이폰 Dolby Vision 8.4 포함)·HDR10/HDR10+ 클립을 감지해 `libplacebo`(Vulkan GPU, 없으면 `zscale` CPU)로 Rec.709 SDR에 맞춥니다. 출력은 항상 SDR 8-bit이며 BT.709 색 태그를 비트스트림에 기록합니다.
 
 ---
 
@@ -81,6 +87,16 @@ flowchart TD
 * **클립 종류별 자동 볼륨 조절**:
   * **동영상 클립 재생 시**: 가족의 대화 목소리가 또렷하게 들리도록 배경음악을 **아주 작게(`6%`)** 깔아줍니다.
   * **사진 슬라이드 & 3초 인트로 재생 시**: 현장음이 없는 구간이므로 배경음악을 **보통 크기(`38%`, 부드러운 페이드 인/아웃 포함)**로 자연스럽게 키워줍니다.
+
+---
+
+### ④-2 상황별 트랜지션 & 오디오 크로스페이드 (v2.5.0)
+![상황별 트랜지션 미리보기](docs/transitions_preview.png)
+* **실제 영상 겹침 ([`_build_cut_render_cmd`](file:///d:/workspace/autocut/autocut_engine.py), [`_join_cut`](file:///d:/workspace/autocut/autocut_engine.py))**:
+  * 각 컷을 렌더링할 때 아웃 지점 뒤 원본 0.25~0.7초(핸들)를 같은 필터 그래프에서 함께 출력하고, 다음 컷 시작부와 `xfade`로 겹칩니다. 전체 길이는 그대로라 자막 싱크가 유지됩니다. (사진·원본 끝 컷은 마지막 프레임 정지 방식으로 대체)
+* **상황별 선택 ([`plan_transition`](file:///d:/workspace/autocut/autocut_engine.py))**:
+  * 점프컷 = 짧은 디졸브/컷, 같은 장면 = 필름 디졸브, 장면 전환(20분 이상·다른 날) = 화이트 딥·라이트 릭·휩 팬(그냥 대화 = 블랙 딥). 프리셋 스타일(빠른 텐션/시네마틱)과 `transition_prob`를 반영합니다.
+* **오디오 크로스페이드**: 영상 컷마다 0.25초 선형 크로스페이드로 '틱' 소리와 뚝 끊김을 없앱니다.
 
 ---
 
@@ -106,18 +122,21 @@ flowchart TD
   * **좌측 카드**: 날짜별 폴더 목록, 실시간 미디어 개수 배지, `🔄 개수 새로고침 (F5)`, 사진 포함 옵션
   * **중앙 카드**: 편집 모드(일반/하이라이트), 인트로 제목·로고 입력창(글자 겹침 없는 2열 다크 폼), 큼직한 `✔` (v-체크) 커스텀 체크박스 옵션
   * **우측 카드**: 출력 인코딩 사양(`HEVC`, 해상도, FPS, `bps`), 스타일 프리셋 및 유튜브 URL 학습기
-  * **하단 좌·우 분할**: 실시간 **CPU / NVIDIA GPU / VRAM 사용률 그래프**([`SystemResourceMonitor`](file:///d:/workspace/autocut/autocut_gui.py#L94-L162))와 실시간 진행 로그 창
+  * **하단 좌·우 분할**: 실시간 **CPU · GPU0(iGPU) · GPU1(NVIDIA, NVENC·VRAM) · NPU 사용률 그래프**([`SystemResourceMonitor`](file:///d:/workspace/autocut/autocut_gui.py) — 작업 관리자와 같은 Windows `GPU Engine` 성능 카운터, GPU 번호도 작업 관리자 순서)와 실시간 진행 로그 창
+  * **최하단 타임라인 ([`TimelinePanel`](file:///d:/workspace/autocut/autocut_timeline.py))**: 선택한 날짜 폴더의 영상·사진을 썸네일 클립으로 배치. 드래그·`Ctrl+←/→`로 순서 변경, 우클릭으로 기기 시간 보정·회전, ⚠ 시각 이상 표시, HDR 배지.
+* **작업 상태 저장 (v2.4.0)**: 설정·선택 폴더를 자동 저장/복원(`Ctrl+S` 즉시 저장), 메뉴에서 설정 + 모든 폴더 타임라인을 `*.autocut.json`으로 내보내기/불러오기.
 
 ---
 
 ## 📦 4. 편집 완료 시 생성되는 결과물 (`편집결과_YYYY-MM-DD` 폴더)
 
-1. **`YYYY-MM-DD_자막포함_완성본.mp4`**: 3초 인트로 + 상단 날짜/로고 + 랜덤 트랜지션 + 동적 BGM + 한국어 자막이 모두 합성된 즉시 감상/업로드용 완성 영상
+1. **`YYYY-MM-DD_자막포함_완성본.mp4`**: 3초 인트로 + 상단 날짜/로고 + 상황별 트랜지션(실제 영상 겹침) + 오디오 크로스페이드 + 동적 BGM + 한국어 자막이 모두 합성된 즉시 감상/업로드용 완성 영상
 2. **`YYYY-MM-DD_무자막_필모라용.mp4`**: 필모라(Filmora)에서 자막 디자인을 자유롭게 수정할 수 있도록 자막만 뺀 클린 영상
 3. **`YYYY-MM-DD_전체자막(필모라용).srt`**: 필모라 타임라인에 바로 드래그 앤 드롭할 수 있는 음성 대화 + 장면 캡션 자막 파일
 4. **`YYYY-MM-DD_음성자막(필모라용).srt`**: 순수 한국어 음성 대화만 담긴 SRT 자막 파일
 5. **`YYYY-MM-DD_베스트샷.jpg`**: AI가 추출한 해당 날짜의 베스트 하이라이트 원본 사진
 6. **`YYYY-MM-DD_편집분석리포트.json`**: 클립별 촬영 시각, 채택 구간, 음성 대화 타임스탬프가 기록된 분석 캐시 리포트
+7. **`YYYY-MM-DD_타임라인순서.json`** (타임라인에서 손댄 경우만): 사용자 지정 클립 순서, 기기별 시간 보정, 클립 회전 — [자동 편집 시작] 시 그대로 적용
 
 ---
 
