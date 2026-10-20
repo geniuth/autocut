@@ -104,6 +104,13 @@ APP_ICON_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets"
 EDIT_RATIO_CHOICES = ["60% (기본)", "50%", "40%", "70%", "80%", "제한 없음"]
 
 
+def _version_tuple(v: str) -> tuple:
+    try:
+        return tuple(int(x) for x in str(v).split(".")[:3])
+    except ValueError:
+        return (0,)
+
+
 def _parse_edit_ratio(label: str) -> float:
     """'60% (기본)' -> 0.6, '제한 없음' -> 1.0."""
     try:
@@ -550,7 +557,11 @@ class AutoCutStudioApp(tk.Tk):
         self.whisper_model = tk.StringVar(value="large-v3-turbo")
         self.denoise_audio = tk.BooleanVar(value=True)
         self.include_scene_captions = tk.BooleanVar(value=True)
-        self.burn_subtitles = tk.BooleanVar(value=True)
+        # Burning subtitles re-encodes the whole finished video once more, so it is opt-in (SRTs are always written)
+        self.burn_subtitles = tk.BooleanVar(value=False)
+        self.show_log_window = tk.BooleanVar(value=False)
+        self._log_geometry = ""
+        self._main_shown = False
         self.export_filmora_clean = tk.BooleanVar(value=True)
         self.include_photos = tk.BooleanVar(value=True)
 
@@ -601,7 +612,12 @@ class AutoCutStudioApp(tk.Tk):
         self._build_ui()
         session = self._read_state_file(SESSION_FILE)
         if session:
-            self._apply_settings(session.get("settings", {}))
+            settings = dict(session.get("settings", {}))
+            if _version_tuple(session.get("version", "0")) < (2, 7, 0):
+                # Subtitle burn-in became opt-in (default off) in v2.7.0; don't carry the old default over
+                settings.pop("burn_subtitles", None)
+            self._apply_settings(settings)
+            self._log_geometry = str(session.get("log_window_geometry", "") or "")
         self.refresh_date_folders(manual=False)
         if session:
             self._restore_selection(session)
@@ -827,6 +843,8 @@ class AutoCutStudioApp(tk.Tk):
                     self.after(300, lambda: self.attributes("-topmost", False))
                 except Exception:
                     pass
+                self._main_shown = True
+                self.after(400, self._apply_log_window_visibility)  # restore the floating log if it was open
                 self._tick_monitor()
 
         self.after(150, lambda: _animate_step(0))
@@ -845,6 +863,7 @@ class AutoCutStudioApp(tk.Tk):
             "denoise_audio": self.denoise_audio,
             "include_scene_captions": self.include_scene_captions,
             "burn_subtitles": self.burn_subtitles,
+            "show_log_window": self.show_log_window,
             "export_filmora_clean": self.export_filmora_clean,
             "include_photos": self.include_photos,
             "enable_intro": self.enable_intro,
@@ -875,6 +894,7 @@ class AutoCutStudioApp(tk.Tk):
             "settings": {k: v.get() for k, v in self._state_vars().items()},
             "selected_folders": [os.path.basename(self._date_folders[i]) for i in sel if i < len(self._date_folders)],
             "active_folder": os.path.basename(self.timeline.folder) if self.timeline.folder else "",
+            "log_window_geometry": self.log_win.geometry() if self.log_win.winfo_viewable() else self._log_geometry,
         }
         if include_timelines:
             # Order / device time corrections / rotations of every date folder, so the file is self-contained
@@ -1299,7 +1319,7 @@ class AutoCutStudioApp(tk.Tk):
             ("상황별 트랜지션(실제 영상 겹침) + 마지막 페이드아웃", self.enable_transitions),
             ("잔잔한 무료 배경음악(BGM) 자동 볼륨 조절 믹싱", self.enable_bgm),
             ("주행·바람 노이즈 제거 및 AI 한국어 음성 자막", self.denoise_audio),
-            ("자막 완성본 + 필모라(Filmora)용 무자막 동시 생성", self.burn_subtitles),
+            ("자막 입힌 완성본도 만들기 (전체 재인코딩 · SRT는 항상 생성)", self.burn_subtitles),
             ("편집 완료 후 결과 폴더 자동으로 열기", self.auto_open_folder_on_done),
         ]
         for lbl_txt, var_obj in chk_list:
@@ -1445,16 +1465,17 @@ class AutoCutStudioApp(tk.Tk):
         # ── Bottom Split Area: Monitor Graph (Left) + Real-time Log (Right) ──
         # (packed last, after the timeline and footer, so it is the area that shrinks on small screens)
         bot_split = ttk.Frame(main)
-        bot_split.columnconfigure(0, weight=5)
-        bot_split.columnconfigure(1, weight=5)
+        bot_split.columnconfigure(0, weight=1)
         bot_split.rowconfigure(0, weight=1)
 
         mon_card = tk.Frame(bot_split, bg=bg_card, highlightthickness=1, highlightbackground="#313244", padx=14, pady=10)
-        mon_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        mon_card.grid(row=0, column=0, sticky="nsew")
 
-        # Title and per-device legend share one row so the graph keeps its height on small screens
+        # Title and per-device legend share one row so the graph keeps its height on small screens;
+        # the floating-log toggle sits at the right end of the same row
         mon_header = ttk.Frame(mon_card, style="Card.TFrame")
         mon_header.pack(fill=tk.X, pady=(0, 6))
+        self._make_vcheck(mon_header, "📋 실시간 분석·편집 로그 창 띄우기", self.show_log_window, bg=bg_card).pack(side=tk.RIGHT)
         ttk.Label(mon_header, text="📊 하드웨어", style="SubHeader.TLabel").pack(side=tk.LEFT, padx=(0, 10))
         self.mon_legend = tk.Frame(mon_header, bg=bg_card)
         self.mon_legend.pack(side=tk.LEFT, fill=tk.X)
@@ -1469,12 +1490,21 @@ class AutoCutStudioApp(tk.Tk):
         )
         self.graph_canvas.pack(fill=tk.BOTH, expand=True)
 
-        log_card = tk.Frame(bot_split, bg=bg_card, highlightthickness=1, highlightbackground="#313244", padx=14, pady=10)
-        log_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        # Real-time log: a floating window (stays above the main window), shown only while the
+        # checkbox is on; it keeps collecting messages while hidden
+        self.log_win = tk.Toplevel(self)
+        self.log_win.withdraw()
+        self.log_win.title("📋 실시간 분석 및 편집 로그 — AutoCut Studio")
+        self.log_win.configure(bg=bg_card)
+        self.log_win.transient(self)
+        self.log_win.protocol("WM_DELETE_WINDOW", lambda: self.show_log_window.set(False))
+        log_card = tk.Frame(self.log_win, bg=bg_card, padx=12, pady=10)
+        log_card.pack(fill=tk.BOTH, expand=True)
 
         log_header = ttk.Frame(log_card, style="Card.TFrame")
         log_header.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(log_header, text="📋 실시간 분석 및 편집 로그", style="SubHeader.TLabel").pack(side=tk.LEFT)
+        ttk.Button(log_header, text="지우기", command=self.clear_log).pack(side=tk.RIGHT)
 
         log_frame = tk.Frame(log_card, bg="#11111b", highlightthickness=1, highlightbackground="#45475a")
         log_frame.pack(fill=tk.BOTH, expand=True)
@@ -1503,6 +1533,7 @@ class AutoCutStudioApp(tk.Tk):
         self.timeline = TimelinePanel(main, log_fn=self.log, bg=bg_card, font_family=f_family)
         self.timeline.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
         self.include_photos.trace_add("write", lambda *_: self._sync_timeline(force=True))
+        self.show_log_window.trace_add("write", lambda *_: self._apply_log_window_visibility())
         bot_split.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
         prog_row = ttk.Frame(footer)
@@ -1679,6 +1710,34 @@ class AutoCutStudioApp(tk.Tk):
         self.log_text.insert(tk.END, msg + "\n")
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+    def clear_log(self):
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _apply_log_window_visibility(self):
+        """Show / hide the floating log window to match its checkbox (deferred until the main window is up)."""
+        if not getattr(self, "_main_shown", False):
+            return
+        win = self.log_win
+        if self.show_log_window.get():
+            if not self._log_geometry:
+                # First open: lower-right of the main window, ~45% x 40% of it
+                self.update_idletasks()
+                w, h = int(self.winfo_width() * 0.45), int(self.winfo_height() * 0.40)
+                x = self.winfo_rootx() + self.winfo_width() - w - 40
+                y = self.winfo_rooty() + self.winfo_height() - h - 160
+                self._log_geometry = f"{w}x{h}+{max(0, x)}+{max(0, y)}"
+            win.geometry(self._log_geometry)
+            win.deiconify()
+            win.lift()
+            self.log_text.see(tk.END)
+        else:
+            if win.winfo_viewable():
+                self._log_geometry = win.geometry()
+            win.withdraw()
+        self._schedule_session_save()
 
     def update_progress(self, pct: float, status_msg: str):
         self.progress_var.set(pct)

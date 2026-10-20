@@ -58,7 +58,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "2.6.0"
+AUTOCUT_VERSION = "2.7.0"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -3189,7 +3189,7 @@ def run_autocut_pipeline(
     whisper_model_size: str = "large-v3-turbo",
     denoise_audio: bool = True,
     include_scene_captions: bool = True,
-    burn_subtitles: bool = True,
+    burn_subtitles: bool = False,
     export_filmora_clean: bool = True,
     include_photos: bool = True,
     enable_intro: bool = True,
@@ -3845,6 +3845,11 @@ def run_autocut_pipeline(
             check=True,
         )
         log_fn(f"✅ 필모라 연동용 무자막 영상 저장 완료: {clean_mp4}")
+        if not burn_subtitles:
+            log_fn(
+                f"ℹ️ 자막은 SRT로만 저장했습니다 ({os.path.basename(srt_full)}, {os.path.basename(srt_speech)}) — "
+                "영상에 직접 입히려면 '자막 입힌 완성본도 만들기'를 켜세요 (전체 재인코딩)"
+            )
 
         if burn_subtitles:
             if progress_fn:
