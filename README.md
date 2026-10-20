@@ -5,7 +5,7 @@
 
 - **Author GitHub**: [https://github.com/geniuth](https://github.com/geniuth)
 - **Repository**: [https://github.com/geniuth/autocut](https://github.com/geniuth/autocut)
-- **Current Version**: `v2.7.0` — 변경 이력은 [CHANGELOG.md](CHANGELOG.md) 참고 (Semantic Versioning)
+- **Current Version**: `v2.7.1` — 변경 이력은 [CHANGELOG.md](CHANGELOG.md) 참고 (Semantic Versioning)
 
 ---
 
@@ -177,6 +177,7 @@ DJI 드론(Mavic 3 / Air 3 / Mini 4 Pro 등)이나 Osmo Action / Osmo Pocket으�
   ```
 
 ### 실행 방법
+- **프로그램을 끄면 인코딩도 함께 종료** (v2.7.1): 편집 중에 창을 닫으면 확인 후 진행 중인 ffmpeg 인코딩을 즉시 멈추고 임시 작업 폴더를 지웁니다. 강제 종료·오류로 꺼져도 Windows 작업 개체(Job Object)가 ffmpeg를 함께 종료합니다 (Ollama 서버는 제외). 완성 파일은 `*.partial.mp4`로 쓰다가 끝나면 이름을 바꾸므로, 중간에 꺼져도 깨진 영상이 정상 이름으로 남지 않습니다.
 - **실시간 분석·편집 로그**는 하단 하드웨어 모니터 오른쪽의 `📋 실시간 분석·편집 로그 창 띄우기`를 체크하면 별도 창(플로팅)으로 뜨고, 끄거나 창의 ✕를 누르면 숨겨집니다 (숨겨져 있어도 로그는 계속 기록, 창 위치는 다음 실행 때 복원).
 - 바탕화면 또는 폴더 내 **`AutoCut_Studio.vbs`** 더블클릭 (콘솔 창 없이 즉시 GUI 실행)
 - 또는 터미널에서 직접 실행:

@@ -11,6 +11,14 @@ from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Callable, List, Dict, Tuple, Optional
 
+import weakref
+
+# Every child process (ffmpeg, ffprobe, ...) is tracked so the GUI can stop them when it closes
+_LIVE_CHILDREN: "weakref.WeakSet" = weakref.WeakSet()
+# Temporary render folders currently in use (removed by the GUI if it is closed mid-render)
+ACTIVE_WORK_DIRS: set = set()
+WORK_DIR_PREFIX = "autocut_render_"
+
 # Prevent any subprocess (ffmpeg, ffprobe, etc.) from popping up a cmd window on Windows
 if os.name == "nt":
     _orig_popen = subprocess.Popen
@@ -19,8 +27,103 @@ if os.name == "nt":
         def __init__(self, *args, **kwargs):
             kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
             super().__init__(*args, **kwargs)
+            _LIVE_CHILDREN.add(self)
 
     subprocess.Popen = _NoWindowPopen
+
+
+_KILL_ON_CLOSE_JOB = None
+
+
+def enable_kill_children_on_exit() -> bool:
+    """
+    Put this process into a Windows Job Object with KILL_ON_JOB_CLOSE: every process it starts afterwards
+    (ffmpeg renders, ffprobe, ...) is killed by Windows the moment this process ends for any reason —
+    window closed, crash, or Task Manager. Breakaway is allowed so a shared server (Ollama) can opt out.
+    """
+    global _KILL_ON_CLOSE_JOB
+    if os.name != "nt" or _KILL_ON_CLOSE_JOB is not None:
+        return _KILL_ON_CLOSE_JOB is not None
+    import ctypes
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateJobObjectW.restype = ctypes.c_void_p
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    k32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+    class _BASIC(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", ctypes.c_uint32),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_uint32),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_uint32),
+            ("SchedulingClass", ctypes.c_uint32),
+        ]
+
+    class _EXT(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BASIC),
+            ("IoInfo", ctypes.c_ulonglong * 6),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        return False
+    info = _EXT()
+    info.BasicLimitInformation.LimitFlags = 0x2000 | 0x800  # KILL_ON_JOB_CLOSE | BREAKAWAY_OK
+    if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):  # ExtendedLimitInformation
+        return False
+    if not k32.AssignProcessToJobObject(job, k32.GetCurrentProcess()):
+        return False
+    _KILL_ON_CLOSE_JOB = job  # keep the handle open for the life of the process; closing it kills the children
+    return True
+
+
+def terminate_child_processes() -> int:
+    """Kill every still-running child process (used when the GUI closes mid-render). Returns how many."""
+    n = 0
+    for p in list(_LIVE_CHILDREN):
+        try:
+            if p.poll() is None:
+                p.kill()
+                n += 1
+        except Exception:
+            pass
+    return n
+
+
+def remove_work_dirs(dirs) -> None:
+    for d in list(dirs):
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def cleanup_stale_work_dirs(min_idle_minutes: float = 30.0) -> int:
+    """Delete render temp folders left behind by an interrupted run (only ones idle for a while)."""
+    import time
+
+    removed = 0
+    base = tempfile.gettempdir()
+    for name in os.listdir(base):
+        if not name.startswith(WORK_DIR_PREFIX):
+            continue
+        path = os.path.join(base, name)
+        try:
+            newest = max([os.path.getmtime(path)] + [e.stat().st_mtime for e in os.scandir(path)])
+        except OSError:
+            continue
+        if time.time() - newest > min_idle_minutes * 60:
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    return removed
 
 # Ensure console stdout/stderr never fail on Windows cp949
 try:
@@ -58,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "2.7.0"
+AUTOCUT_VERSION = "2.7.1"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -881,13 +984,20 @@ def ensure_ollama_server(log_fn: Callable[[str], None] = print, wait_sec: float 
         return False
     try:
         flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
-        subprocess.Popen(
-            [exe, "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            creationflags=flags,
-        )
+        # Ollama is a shared server: break away from AutoCut's kill-on-exit job so closing AutoCut leaves it running
+        for extra in ((0x01000000, 0) if os.name == "nt" else (0,)):  # CREATE_BREAKAWAY_FROM_JOB, then without
+            try:
+                proc = subprocess.Popen(
+                    [exe, "serve"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=flags | extra,
+                )
+                _LIVE_CHILDREN.discard(proc)  # never killed by terminate_child_processes()
+                break
+            except OSError:
+                continue
         log_fn("🦙 로컬 Ollama 서버를 백그라운드로 시작합니다...")
     except Exception:
         return False
@@ -3350,7 +3460,8 @@ def run_autocut_pipeline(
         except Exception:
             analysis_summary = None
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory(prefix=WORK_DIR_PREFIX) as tmpdir:
+        ACTIVE_WORK_DIRS.add(tmpdir)
         if analysis_summary is None:
             model = None
             clips_meta = []
@@ -3823,6 +3934,10 @@ def run_autocut_pipeline(
         log_fn("🎬 컷 편집 클립 고속 병합 중...")
         is_hevc = ("hevc" in video_codec.lower()) or ("265" in video_codec.lower())
         tag_args = ["-tag:v", "hvc1"] if is_hevc else []
+        # Final files are written under *.partial.mp4 and renamed only when complete, so an interrupted
+        # run (program closed, crash) never leaves a broken video under the real name
+        clean_part = clean_mp4[:-4] + ".partial.mp4"
+        subbed_part = subbed_mp4[:-4] + ".partial.mp4"
         subprocess.run(
             [
                 "ffmpeg",
@@ -3840,10 +3955,11 @@ def run_autocut_pipeline(
                 *tag_args,
                 "-movflags",
                 "+faststart",
-                clean_mp4,
+                clean_part,
             ],
             check=True,
         )
+        os.replace(clean_part, clean_mp4)
         log_fn(f"✅ 필모라 연동용 무자막 영상 저장 완료: {clean_mp4}")
         if not burn_subtitles:
             log_fn(
@@ -3872,11 +3988,12 @@ def run_autocut_pipeline(
                     "copy",
                     "-movflags",
                     "+faststart",
-                    subbed_mp4,
+                    subbed_part,
                 ],
                 cwd=tmpdir,
                 check=True,
             )
+            os.replace(subbed_part, subbed_mp4)
             log_fn(f"✅ 자막 포함 완성본 영상 저장 완료: {subbed_mp4}")
 
         if not export_filmora_clean and burn_subtitles and os.path.exists(clean_mp4):

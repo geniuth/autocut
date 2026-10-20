@@ -128,6 +128,7 @@ flowchart TD
   * **하단 좌·우 분할**: 실시간 **CPU · GPU0(iGPU) · GPU1(NVIDIA, NVENC·VRAM) · NPU 사용률 그래프**([`SystemResourceMonitor`](file:///d:/workspace/autocut/autocut_gui.py) — 작업 관리자와 같은 Windows `GPU Engine` 성능 카운터, GPU 번호도 작업 관리자 순서)가 하단 전체 폭을 쓰고, **실시간 분석·편집 로그는 플로팅 창**(모니터 제목줄 오른쪽 체크박스로 표시/숨김, 창 ✕ = 체크 해제, 위치 저장 — v2.7.0)
   * **최하단 타임라인 ([`TimelinePanel`](file:///d:/workspace/autocut/autocut_timeline.py))**: 선택한 날짜 폴더의 영상·사진을 썸네일 클립으로 배치. 드래그·`Ctrl+←/→`로 순서 변경, 우클릭으로 기기 시간 보정·회전, ⚠ 시각 이상 표시, HDR 배지. `Ctrl/Shift+클릭`·`Ctrl+A` 다중 선택 후 함께 이동·회전 (v2.6.0), 굵고 대비 높은 스크롤 바 + `보는 중 a–b / N` 위치 표시.
 * **프로그램 아이콘 (v2.6.0)**: 시네마 카메라 아이콘(`assets/autocut_icon.ico`)이 창 제목줄·작업 표시줄·스플래시에 표시됩니다.
+* **종료 시 인코딩 정리 (`enable_kill_children_on_exit`, `terminate_child_processes`, v2.7.1)**: 앱 프로세스를 KILL_ON_JOB_CLOSE 작업 개체에 넣어 강제 종료·오류 시에도 ffmpeg가 함께 종료되고(Ollama는 job 이탈), 편집 중 창을 닫으면 확인 후 즉시 중단 + `autocut_render_*` 임시 폴더 삭제(남은 폴더는 다음 실행 때 30분 이상 방치된 것만 정리). 최종 영상은 `*.partial.mp4` → 완료 시 이름 변경.
 * **작업 상태 저장 (v2.4.0)**: 설정·선택 폴더를 자동 저장/복원(`Ctrl+S` 즉시 저장), 메뉴에서 설정 + 모든 폴더 타임라인을 `*.autocut.json`으로 내보내기/불러오기.
 
 ---

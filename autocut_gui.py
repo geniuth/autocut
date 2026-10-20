@@ -88,7 +88,15 @@ from autocut_engine import (
     _load_kr_font,
     AUTOCUT_VERSION,
     DEFAULT_AI_MODELS,
+    enable_kill_children_on_exit,
+    terminate_child_processes,
+    remove_work_dirs,
+    cleanup_stale_work_dirs,
+    ACTIVE_WORK_DIRS,
 )
+
+# Before anything is spawned (nvidia-smi monitor, ffprobe, renders): children die with this process
+enable_kill_children_on_exit()
 from autocut_timeline import (
     TimelinePanel,
     load_manual_order,
@@ -530,6 +538,9 @@ class AutoCutStudioApp(tk.Tk):
         self.geometry("1920x1080+0+0")
         self.minsize(1360, 820)
         self.configure(bg="#181825")
+        self._running = False
+        # Temp render folders left by a run that was cut off earlier (only ones idle 30+ minutes)
+        threading.Thread(target=cleanup_stale_work_dirs, daemon=True).start()
 
         base_family = "맑은 고딕"
         for fname, sz in [
@@ -850,8 +861,21 @@ class AutoCutStudioApp(tk.Tk):
         self.after(150, lambda: _animate_step(0))
 
     def _on_close(self):
+        if self._running and not messagebox.askyesno(
+            "편집 중 종료",
+            "자동 편집(인코딩)이 진행 중입니다.\n종료하면 진행 중인 인코딩도 함께 중단되고 임시 파일은 삭제됩니다.\n\n지금 종료할까요?",
+            icon="warning",
+            parent=self,
+        ):
+            return
+        self._stop_requested = True
         self.save_session()
         self.monitor.stop()
+        if self._running:
+            # Stop the encode now (the Job Object would also kill it once this process exits)
+            terminate_child_processes()
+            time.sleep(0.5)  # let the killed ffmpeg release its files before deleting the work folder
+            remove_work_dirs(ACTIVE_WORK_DIRS)
         self.destroy()
 
     # ── Work state: auto session + exportable project file ───────────────────
@@ -1992,6 +2016,7 @@ class AutoCutStudioApp(tk.Tk):
 
         selected_paths = [self._date_folders[i] for i in sel]
         self._stop_requested = False
+        self._running = True
         self.start_btn.configure(state=tk.DISABLED)
         self.stop_btn.configure(state=tk.NORMAL)
         self.progress_var.set(0.0)
@@ -2077,6 +2102,7 @@ class AutoCutStudioApp(tk.Tk):
             self.after(0, self.log, f"❌ 작업 중단/오류: {e}")
             self.after(0, lambda: self.status_var.set(f"오류/중단: {e}"))
         finally:
+            self._running = False
             self.after(0, lambda: self.start_btn.configure(state=tk.NORMAL))
             self.after(0, lambda: self.stop_btn.configure(state=tk.DISABLED))
 
