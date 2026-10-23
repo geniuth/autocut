@@ -866,10 +866,34 @@ class AutoCutStudioApp(tk.Tk):
                 except Exception:
                     pass
                 self._main_shown = True
+                self._apply_crisp_window_icon(self)
                 self.after(400, self._apply_log_window_visibility)  # restore the floating log if it was open
                 self._tick_monitor()
 
         self.after(150, lambda: _animate_step(0))
+
+    @staticmethod
+    def _apply_crisp_window_icon(win):
+        """
+        Give the title bar / taskbar button icons loaded at the exact pixel size for this window's DPI
+        (Tk's iconbitmap stretches the 32px image, which looks blurry at 150-200% scaling).
+        """
+        if os.name != "nt" or not os.path.exists(APP_ICON_ICO):
+            return
+        try:
+            win.update_idletasks()
+            u32 = ctypes.windll.user32
+            hwnd = u32.GetParent(win.winfo_id()) or win.winfo_id()
+            dpi = u32.GetDpiForWindow(hwnd) or 96
+            u32.LoadImageW.restype = ctypes.c_void_p
+            u32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p]
+            for which, metric in ((1, 11), (0, 49)):  # ICON_BIG / SM_CXICON, ICON_SMALL / SM_CXSMICON
+                px = u32.GetSystemMetricsForDpi(metric, dpi)
+                hicon = u32.LoadImageW(None, APP_ICON_ICO, 1, px, px, 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
+                if hicon:
+                    u32.SendMessageW(hwnd, 0x80, which, hicon)  # WM_SETICON
+        except Exception:
+            pass
 
     def _on_close(self):
         if self._running and not messagebox.askyesno(
@@ -1821,6 +1845,7 @@ class AutoCutStudioApp(tk.Tk):
             win.geometry(self._log_geometry)
             win.deiconify()
             win.lift()
+            self._apply_crisp_window_icon(win)
             self.log_text.see(tk.END)
         else:
             if win.winfo_viewable():

@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "2.8.0"
+AUTOCUT_VERSION = "2.8.1"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {

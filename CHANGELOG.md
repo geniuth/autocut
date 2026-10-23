@@ -4,6 +4,14 @@ All notable changes to **AutoCut Studio 2026** are automatically versioned and t
 
 ---
 
+## [v2.8.1] - 2026-10-23
+### 🎥 선명한 아이콘 · 작업 표시줄 고정 수정
+- **아이콘 크기 보강**: `autocut_icon.ico`에 Windows가 배율별로 요청하는 16·20·24·30·32·36·40·48·60·64·72·80·96·128·256px를 모두 담아 확대·축소 없이 표시.
+- **창 아이콘을 DPI에 맞게**: Tk 기본 방식은 32px를 늘려 흐릿했으므로, 창이 뜬 뒤 `LoadImage` + `WM_SETICON`으로 현재 DPI의 정확한 크기(200%: 큰 아이콘 64px / 작은 아이콘 32px)를 설정 (메인 창·로그 창).
+- **작업 표시줄 고정**: 실행 중인 창을 바로 고정하면 `pythonw.exe`(인수 없음)만 고정되어 파이썬 아이콘이 보이고 클릭해도 AutoCut이 실행되지 않음 → 앱 ID(`YumTaeng.AutoCutStudio.2026`)를 넣은 `AutoCut` 바로가기로 고정하도록 안내.
+
+---
+
 ## [v2.8.0] - 2026-10-23
 ### 🌈 HLG HDR 출력 옵션 · 작업 폴더에 저장 파일 생성
 - **출력 다이내믹 레인지 선택**: `SDR (기본 · Rec.709 8-bit)` / `HLG HDR (BT.2020 10-bit · HEVC)`.
