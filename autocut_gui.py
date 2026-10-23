@@ -110,6 +110,12 @@ PROJECT_FILE_EXT = ".autocut.json"
 APP_ICON_ICO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "autocut_icon.ico")
 APP_ICON_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "autocut_icon.png")
 EDIT_RATIO_CHOICES = ["60% (기본)", "50%", "40%", "70%", "80%", "제한 없음"]
+DYNAMIC_RANGE_CHOICES = {
+    "SDR (기본 · Rec.709 8-bit)": "sdr",
+    "HLG HDR (BT.2020 10-bit · HEVC)": "hlg",
+}
+# Written into the work folder on every manual save (Ctrl+S): settings + every date folder's timeline
+FOLDER_SAVE_NAME = "AutoCut_작업저장.autocut.json"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -594,6 +600,7 @@ class AutoCutStudioApp(tk.Tk):
         self.out_codec_var = tk.StringVar(value="HEVC (H.265 - hevc_nvenc 권장)")
         self.color_profile_var = tk.StringVar(value=next(iter(COLOR_PROFILE_PRESETS.keys())))
         self.max_edit_ratio_var = tk.StringVar(value=EDIT_RATIO_CHOICES[0])
+        self.dynamic_range_var = tk.StringVar(value=next(iter(DYNAMIC_RANGE_CHOICES)))
 
         # YouTube Style Analyzer & Preset variables
         self.all_presets = get_all_style_presets()
@@ -768,7 +775,11 @@ class AutoCutStudioApp(tk.Tk):
         folder_menu = tk.Menu(menubar, tearoff=0, font=("맑은 고딕", 10))
         folder_menu.add_command(label="🔄 폴더 및 영상/사진 개수 새로고침 (F5)", command=lambda: self.refresh_date_folders(manual=True))
         folder_menu.add_separator()
-        folder_menu.add_command(label="💾 작업 상태 저장 (Ctrl+S)", command=lambda: self.save_session(manual=True))
+        folder_menu.add_command(
+            label=f"💾 작업 상태 저장 (Ctrl+S) — 작업 폴더에 {FOLDER_SAVE_NAME} 생성",
+            command=lambda: self.save_session(manual=True),
+        )
+        folder_menu.add_command(label="📂 작업 폴더의 저장 파일 불러오기", command=lambda: self.load_folder_save(ask=False))
         folder_menu.add_command(label="💾 작업 파일로 내보내기 (설정 + 타임라인)...", command=self.export_project_file)
         folder_menu.add_command(label="📂 작업 파일 불러오기...", command=self.import_project_file)
         folder_menu.add_separator()
@@ -905,6 +916,7 @@ class AutoCutStudioApp(tk.Tk):
             "out_codec": self.out_codec_var,
             "color_profile": self.color_profile_var,
             "max_edit_ratio": self.max_edit_ratio_var,
+            "dynamic_range": self.dynamic_range_var,
             "style_preset": self.style_preset_var,
             "yt_url": self.yt_url_var,
         }
@@ -951,6 +963,7 @@ class AutoCutStudioApp(tk.Tk):
             "intro_style": set(INTRO_STYLE_PRESETS),
             "color_profile": set(COLOR_PROFILE_PRESETS),
             "max_edit_ratio": set(EDIT_RATIO_CHOICES),
+            "dynamic_range": set(DYNAMIC_RANGE_CHOICES),
             "style_preset": set(self.all_presets),
         }
         for key, var in self._state_vars().items():
@@ -990,12 +1003,67 @@ class AutoCutStudioApp(tk.Tk):
         self._session_save_job = None
         try:
             self._write_state_file(SESSION_FILE, self.collect_state())
-            if manual:
-                self.status_var.set(f"💾 작업 상태 저장 완료 — {time.strftime('%H:%M:%S')} (다음 실행 시 자동 복원)")
-                self.log("💾 작업 상태(설정·선택 폴더)를 저장했습니다. 타임라인 순서·회전·시간 보정은 폴더별로 이미 저장되어 있습니다.")
         except Exception as e:
             if manual:
                 self.log(f"⚠️ 작업 상태 저장 실패: {e}")
+            return
+        if not manual:
+            return
+        # Manual save also drops a save file into the work folder itself (settings + all timelines)
+        base = self.target_dir.get().strip()
+        if not os.path.isdir(base):
+            self.status_var.set(f"💾 작업 상태 저장 완료 — {time.strftime('%H:%M:%S')} (작업 폴더가 없어 폴더 저장 파일은 생략)")
+            return
+        fp = os.path.join(base, FOLDER_SAVE_NAME)
+        try:
+            state = self.collect_state(include_timelines=True)
+            self._write_state_file(fp, state)
+            self.status_var.set(f"💾 작업 상태 저장 완료 — {time.strftime('%H:%M:%S')} → {fp}")
+            self.log(f"💾 작업 상태를 작업 폴더에 저장했습니다: {fp} (설정 + 타임라인 {len(state['timelines'])}개 폴더)")
+        except Exception as e:
+            self.log(f"⚠️ 작업 폴더에 저장 파일을 만들지 못했습니다: {e}")
+
+    def _load_project_state(self, state: dict, source: str, folder_override: str = ""):
+        """Apply a saved project state (settings + timelines). folder_override: the folder the save file was found in."""
+        settings = dict(state.get("settings", {}))
+        if folder_override:
+            settings["target_dir"] = folder_override  # the folder may have been moved or renamed since saving
+        self._apply_settings(settings)
+        self.refresh_date_folders(manual=False)
+        restored = 0
+        by_name = {os.path.basename(p): p for p in self._date_folders}
+        for name, data in (state.get("timelines") or {}).items():
+            folder = by_name.get(name)
+            if folder and isinstance(data, dict):
+                try:
+                    write_timeline_file(folder, self._output_dir_for(folder), data)
+                    restored += 1
+                except Exception as e:
+                    self.log(f"⚠️ [{name}] 타임라인 복원 실패: {e}")
+        self._restore_selection(state)
+        self._sync_timeline(force=True)
+        self.save_session()
+        self.log(f"📂 작업 상태 불러오기 완료: {source} (설정 + 타임라인 {restored}개 폴더 복원)")
+        self.status_var.set(f"📂 작업 상태 불러옴: {source}")
+
+    def load_folder_save(self, ask: bool = False) -> bool:
+        """Load the work folder's own save file (AutoCut_작업저장.autocut.json) if it has one."""
+        base = self.target_dir.get().strip()
+        fp = os.path.join(base, FOLDER_SAVE_NAME)
+        state = self._read_state_file(fp) if os.path.isfile(fp) else None
+        if not state or "settings" not in state:
+            if not ask:
+                messagebox.showinfo("저장 파일 없음", f"이 작업 폴더에 저장 파일이 없습니다:\n{fp}")
+            return False
+        when = str(state.get("saved_at", "")).replace("T", " ")
+        if ask and not messagebox.askyesno(
+            "저장된 작업 상태",
+            f"이 폴더에 저장된 작업 상태가 있습니다 ({when} 저장).\n설정과 타임라인(순서·회전·시간 보정)을 불러올까요?",
+            parent=self,
+        ):
+            return False
+        self._load_project_state(state, FOLDER_SAVE_NAME, folder_override=base)
+        return True
 
     def export_project_file(self):
         base = self.target_dir.get().strip()
@@ -1027,23 +1095,9 @@ class AutoCutStudioApp(tk.Tk):
         if not state or "settings" not in state:
             messagebox.showerror("불러오기 실패", "AutoCut 작업 파일이 아니거나 손상되었습니다.")
             return
-        self._apply_settings(state["settings"])
-        self.refresh_date_folders(manual=False)
-        restored = 0
-        by_name = {os.path.basename(p): p for p in self._date_folders}
-        for name, data in (state.get("timelines") or {}).items():
-            folder = by_name.get(name)
-            if folder and isinstance(data, dict):
-                try:
-                    write_timeline_file(folder, self._output_dir_for(folder), data)
-                    restored += 1
-                except Exception as e:
-                    self.log(f"⚠️ [{name}] 타임라인 복원 실패: {e}")
-        self._restore_selection(state)
-        self._sync_timeline(force=True)
-        self.save_session()
-        self.log(f"📂 작업 파일 불러오기 완료: {os.path.basename(fp)} (설정 + 타임라인 {restored}개 폴더 복원)")
-        self.status_var.set(f"📂 작업 파일 불러옴: {os.path.basename(fp)}")
+        # A save file sitting in a work folder belongs to that folder
+        override = os.path.dirname(fp) if os.path.basename(fp) == FOLDER_SAVE_NAME else ""
+        self._load_project_state(state, os.path.basename(fp), folder_override=override)
 
     def _build_ui(self):
         f_family = "맑은 고딕"
@@ -1442,6 +1496,17 @@ class AutoCutStudioApp(tk.Tk):
             side=tk.LEFT, padx=(6, 0)
         )
 
+        ttk.Label(enc_grid, text="다이내믹 레인지", style="FormLabel.TLabel").grid(
+            row=6, column=0, sticky="w", padx=(0, 14), pady=4
+        )
+        ttk.Combobox(
+            enc_grid,
+            textvariable=self.dynamic_range_var,
+            values=list(DYNAMIC_RANGE_CHOICES),
+            state="readonly",
+            font=(f_family, 10),
+        ).grid(row=6, column=1, sticky="ew", pady=4)
+
         tk.Frame(col3, bg="#313244", height=1).pack(fill=tk.X, pady=(4, 8))
 
         ttk.Label(col3, text="🎨 편집 스타일 프리셋 & 유튜브 학습", style="SubHeader.TLabel").pack(
@@ -1772,6 +1837,7 @@ class AutoCutStudioApp(tk.Tk):
         if selected:
             self.target_dir.set(selected)
             self.refresh_date_folders(manual=True)
+            self.load_folder_save(ask=True)  # offer the folder's own save file, if it has one
 
     def refresh_date_folders(self, manual: bool = False, auto_triggered: bool = False):
         prev_sel_indices = self.date_listbox.curselection()
@@ -2075,6 +2141,7 @@ class AutoCutStudioApp(tk.Tk):
                     manual_order=manual_order,
                     clip_rotations=clip_rotations,
                     max_edit_ratio=_parse_edit_ratio(self.max_edit_ratio_var.get()),
+                    output_dynamic_range=DYNAMIC_RANGE_CHOICES.get(self.dynamic_range_var.get(), "sdr"),
                     log_fn=lambda m: self.after(0, self.log, m),
                     progress_fn=lambda p, s: self.after(0, self.update_progress, p, s),
                     stop_check_fn=lambda: self._stop_requested,

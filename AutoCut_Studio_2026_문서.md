@@ -80,7 +80,9 @@ flowchart TD
 * **클립 수동 회전 (`rotation_vf`, v2.4.0)**:
   * 옆으로·거꾸로 찍힌 클립은 타임라인에서 `R` / `Shift+R` / 우클릭(180°)으로 돌립니다. 영상은 `transpose`, 사진은 회전 후 블러 배경을 다시 만들며, 수동 회전한 클립은 자동 상하반전 보정을 건너뜁니다.
 * **HDR 자동 감지 & SDR 톤매핑 (`detect_dynamic_range`, `get_hdr_tonemap_vf`, v2.3.0)**:
-  * HLG(아이폰 Dolby Vision 8.4 포함)·HDR10/HDR10+ 클립을 감지해 `libplacebo`(Vulkan GPU, 없으면 `zscale` CPU)로 Rec.709 SDR에 맞춥니다. 출력은 항상 SDR 8-bit이며 BT.709 색 태그를 비트스트림에 기록합니다.
+  * HLG(아이폰 Dolby Vision 8.4 포함)·HDR10/HDR10+ 클립을 감지해 `libplacebo`(Vulkan GPU, 없으면 `zscale` CPU)로 Rec.709 SDR에 맞춥니다. BT.709 색 태그를 비트스트림에 기록합니다.
+* **출력 다이내믹 레인지 선택 (`output_dynamic_range`, `sdr_to_output_vf`, `hdr_to_hlg_vf`, v2.8.0)**:
+  * **SDR(기본)** 또는 **HLG HDR**(HEVC Main10 · BT.2020 · ARIB STD-B67). HLG에서는 SDR 영상·사진·인트로를 SDR 그래프 끝에서 HDR 기준 백색 203nit로 변환하고(실측: HDR TV처럼 다시 보면 SDR 마스터와 밝기 일치), HLG 원본은 그대로, PQ는 HLG로 변환합니다. HDR 원본에는 8-bit 전용 `eq`를 생략하고 날짜/로고 HUD를 75%로 낮춰 합성, 화이트 딥→블랙 딥, 라이트 릭은 10-bit 값으로, 자막 입히기는 생략(SRT 제공).
 
 ---
 
@@ -129,7 +131,7 @@ flowchart TD
   * **최하단 타임라인 ([`TimelinePanel`](file:///d:/workspace/autocut/autocut_timeline.py))**: 선택한 날짜 폴더의 영상·사진을 썸네일 클립으로 배치. 드래그·`Ctrl+←/→`로 순서 변경, 우클릭으로 기기 시간 보정·회전, ⚠ 시각 이상 표시, HDR 배지. `Ctrl/Shift+클릭`·`Ctrl+A` 다중 선택 후 함께 이동·회전 (v2.6.0), 굵고 대비 높은 스크롤 바 + `보는 중 a–b / N` 위치 표시.
 * **프로그램 아이콘 (v2.6.0)**: 시네마 카메라 아이콘(`assets/autocut_icon.ico`)이 창 제목줄·작업 표시줄·스플래시에 표시됩니다.
 * **종료 시 인코딩 정리 (`enable_kill_children_on_exit`, `terminate_child_processes`, v2.7.1)**: 앱 프로세스를 KILL_ON_JOB_CLOSE 작업 개체에 넣어 강제 종료·오류 시에도 ffmpeg가 함께 종료되고(Ollama는 job 이탈), 편집 중 창을 닫으면 확인 후 즉시 중단 + `autocut_render_*` 임시 폴더 삭제(남은 폴더는 다음 실행 때 30분 이상 방치된 것만 정리). 최종 영상은 `*.partial.mp4` → 완료 시 이름 변경.
-* **작업 상태 저장 (v2.4.0)**: 설정·선택 폴더를 자동 저장/복원(`Ctrl+S` 즉시 저장), 메뉴에서 설정 + 모든 폴더 타임라인을 `*.autocut.json`으로 내보내기/불러오기.
+* **작업 상태 저장 (v2.4.0 · v2.8.0)**: 설정·선택 폴더를 자동 저장/복원. `Ctrl+S`(수동 저장) 시 **작업 폴더에 `AutoCut_작업저장.autocut.json`**(설정 + 모든 폴더 타임라인)을 생성하고, `폴더 찾기`로 그 폴더를 고르면 불러올지 확인 (폴더 위치가 바뀌어도 그 폴더 기준으로 복원). 메뉴에서 임의 위치로 내보내기/불러오기도 가능.
 
 ---
 

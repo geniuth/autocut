@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "2.7.1"
+AUTOCUT_VERSION = "2.8.0"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -549,8 +549,41 @@ def _fps_to_ffmpeg_expr(out_fps: float = 60.0) -> str:
     return str(max(15, int(round(out_fps))))
 
 
-def _build_vcodec_args(video_codec: str = "hevc_nvenc", video_bitrate_bps: int = 25000000) -> List[str]:
+OUTPUT_DR_LABELS: Dict[str, str] = {
+    "sdr": "SDR (Rec.709 8-bit)",
+    "hlg": "HLG HDR (BT.2020 10-bit HEVC)",
+}
+
+
+def output_pix_fmt(output_dr: str = "sdr") -> str:
+    return "yuv420p10le" if output_dr == "hlg" else "yuv420p"
+
+
+def _build_vcodec_args(video_codec: str = "hevc_nvenc", video_bitrate_bps: int = 25000000, output_dr: str = "sdr") -> List[str]:
     codec = (video_codec or "hevc_nvenc").strip().lower()
+    if output_dr == "hlg":
+        # HLG master: HEVC Main10 with BT.2020 primaries/matrix + ARIB STD-B67 transfer written into the VUI
+        bps = max(2_000_000, int(video_bitrate_bps))
+        return [
+            "-c:v",
+            "hevc_nvenc",
+            "-tag:v",
+            "hvc1",
+            "-profile:v",
+            "main10",
+            "-preset",
+            "p4",
+            "-rc",
+            "vbr",
+            "-b:v",
+            str(bps),
+            "-maxrate",
+            str(int(bps * 1.25)),
+            "-bufsize",
+            str(int(bps * 2.0)),
+            "-bsf:v",
+            "hevc_metadata=colour_primaries=9:transfer_characteristics=18:matrix_coefficients=9",
+        ]
     if "hevc" in codec or "265" in codec:
         enc = "hevc_nvenc"
         tag_args = ["-tag:v", "hvc1"]
@@ -844,6 +877,46 @@ def get_hdr_tonemap_vf(dr: Dict[str, str], gpu: bool = True) -> Tuple[List[str],
     return [], (
         f"zscale=tin={trc}:pin=bt2020:min=bt2020nc:t=linear:p=bt2020:npl=203,format=gbrpf32le,"
         "zscale=p=bt709,tonemap=tonemap=mobius:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+    )
+
+
+def _libplacebo_decode_args() -> List[str]:
+    """Decoder for graphs that use libplacebo: NVDEC when an NVIDIA GPU is present (tested correct with the
+    Vulkan device), otherwise software. Never '-hwaccel auto', which yields solid-blue 10-bit frames here."""
+    return ["-hwaccel", "cuda"] if shutil.which("nvidia-smi") else []
+
+
+def sdr_to_output_vf(output_dr: str = "sdr") -> Tuple[List[str], str]:
+    """
+    (extra input args, filter) that finish an SDR Rec.709 graph in the output format.
+    SDR output: plain 8-bit 4:2:0. HLG output: SDR white placed at the BT.2408 HDR reference white
+    (203 nits ~ 75% HLG signal) in BT.2020 10-bit — libplacebo on Vulkan, or zscale (npl=203) on the CPU.
+    """
+    if output_dr != "hlg":
+        return [], "format=yuv420p"
+    if _hdr_tonemap_backend() == "libplacebo":
+        return list(_LIBPLACEBO_HW_ARGS), (
+            "format=yuv420p,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,"
+            "libplacebo=colorspace=bt2020nc:color_primaries=bt2020:color_trc=arib-std-b67:range=tv:format=yuv420p10le"
+        )
+    return [], (
+        "zscale=tin=bt709:pin=bt709:min=bt709:t=linear,format=gbrpf32le,"
+        "zscale=p=bt2020:t=arib-std-b67:m=bt2020nc:r=tv:npl=203,format=yuv420p10le"
+    )
+
+
+def hdr_to_hlg_vf(dr: Dict[str, str]) -> Tuple[List[str], str]:
+    """(extra input args, filter) bringing an HDR clip into HLG for an HLG master: HLG stays as is, PQ is converted."""
+    if not dr or dr.get("range") != "HDR10":
+        return [], ""
+    if _hdr_tonemap_backend() == "libplacebo":
+        return list(_LIBPLACEBO_HW_ARGS), (
+            "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,"
+            "libplacebo=colorspace=bt2020nc:color_primaries=bt2020:color_trc=arib-std-b67:range=tv:format=yuv420p10le"
+        )
+    return [], (
+        "zscale=tin=smpte2084:pin=bt2020:min=bt2020nc:t=linear:npl=203,format=gbrpf32le,"
+        "zscale=p=bt2020:t=arib-std-b67:m=bt2020nc:r=tv:npl=203,format=yuv420p10le"
     )
 
 
@@ -2545,6 +2618,7 @@ def create_intro_segment(
     video_bitrate_bps: int = 25000000,
     video_codec: str = "hevc_nvenc",
     intro_style: str = "classic_frame",
+    output_dr: str = "sdr",
 ):
     """
     Create a 3-second Intro clip from the Best Shot using the selected intro_style:
@@ -2566,7 +2640,8 @@ def create_intro_segment(
     composed_rgb.save(intro_frame_png, "PNG")
 
     fps_expr = _fps_to_ffmpeg_expr(out_fps)
-    vcodec_args = _build_vcodec_args(video_codec, video_bitrate_bps)
+    vcodec_args = _build_vcodec_args(video_codec, video_bitrate_bps, output_dr)
+    out_hw, out_tail = sdr_to_output_vf(output_dr)
 
     if bgm_path and os.path.isfile(bgm_path):
         fade_out_st = max(0.2, round(duration - 0.35, 2))
@@ -2575,6 +2650,7 @@ def create_intro_segment(
             "-y",
             "-v",
             "error",
+            *out_hw,
             "-loop",
             "1",
             "-t",
@@ -2590,7 +2666,7 @@ def create_intro_segment(
             "-i",
             bgm_path,
             "-vf",
-            f"fps={fps_expr},fade=t=in:st=0:d=0.45,format=yuv420p",
+            f"fps={fps_expr},fade=t=in:st=0:d=0.45,{out_tail}",
             "-af",
             f"volume={bgm_photo_vol:.3f},afade=t=in:st=0:d=0.45,afade=t=out:st={fade_out_st:.2f}:d=0.35,aresample=48000",
             "-map",
@@ -2615,6 +2691,7 @@ def create_intro_segment(
             "-y",
             "-v",
             "error",
+            *out_hw,
             "-loop",
             "1",
             "-t",
@@ -2628,7 +2705,7 @@ def create_intro_segment(
             "-i",
             "anullsrc=channel_layout=stereo:sample_rate=48000",
             "-vf",
-            f"fps={fps_expr},fade=t=in:st=0:d=0.45,format=yuv420p",
+            f"fps={fps_expr},fade=t=in:st=0:d=0.45,{out_tail}",
             *vcodec_args,
             "-c:a",
             "aac",
@@ -2845,8 +2922,10 @@ def _extract_last_frame_clip(
     out_fps: float = 60.0,
     video_bitrate_bps: int = 25000000,
     video_codec: str = "hevc_nvenc",
+    output_dr: str = "sdr",
 ):
-    """Extract the last frame of seg_mp4_path and loop it for trans_dur seconds for seamless xfade into next clip."""
+    """Extract the last frame of seg_mp4_path and loop it for trans_dur seconds for seamless xfade into next clip.
+    (The still keeps the segment's code values, so for an HLG master it stays HLG — only re-tagged as 10-bit.)"""
     last_jpg = tail_mp4_path + ".jpg"
     cmd_frame = [
         "ffmpeg",
@@ -2868,7 +2947,7 @@ def _extract_last_frame_clip(
         return False
 
     fps_expr = _fps_to_ffmpeg_expr(out_fps)
-    vcodec_args = _build_vcodec_args(video_codec, video_bitrate_bps)
+    vcodec_args = _build_vcodec_args(video_codec, video_bitrate_bps, output_dr)
     cmd_loop = [
         "ffmpeg",
         "-y",
@@ -2881,7 +2960,7 @@ def _extract_last_frame_clip(
         "-i",
         last_jpg,
         "-vf",
-        f"fps={fps_expr},format=yuv420p",
+        f"fps={fps_expr},format={output_pix_fmt(output_dr)}",
         *vcodec_args,
         "-an",
         tail_mp4_path,
@@ -2994,17 +3073,20 @@ def plan_transition(
     return ("fade", 0.45) if rng.random() <= prob else ("none", 0.0)
 
 
-def _xfade_video_graph(name: str, td: float) -> str:
+def _xfade_video_graph(name: str, td: float, pix_fmt: str = "yuv420p") -> str:
     """Filter graph from [0:v] (outgoing handle) and [1:v] (incoming cut) to [v]."""
     if name == "whip":
         return (
             f"[0:v][1:v]xfade=transition=custom:duration={td:.3f}:offset=0:expr='{_XFADE_WHIP_EXPR}',"
             f"split=2[x1][x2];[x1]trim=end={td:.3f},setpts=PTS-STARTPTS,tmix=frames=5[w];"
-            f"[x2]trim=start={td:.3f},setpts=PTS-STARTPTS[r];[w][r]concat=n=2:v=1:a=0,format=yuv420p[v]"
+            f"[x2]trim=start={td:.3f},setpts=PTS-STARTPTS[r];[w][r]concat=n=2:v=1:a=0,format={pix_fmt}[v]"
         )
     if name == "lightleak":
-        return f"[0:v][1:v]xfade=transition=custom:duration={td:.3f}:offset=0:expr='{_XFADE_LIGHTLEAK_EXPR}',format=yuv420p[v]"
-    return f"[0:v][1:v]xfade=transition={name}:duration={td:.3f}:offset=0,format=yuv420p[v]"
+        expr = _XFADE_LIGHTLEAK_EXPR
+        if "10" in pix_fmt:  # glow targets are 8-bit code values; scale them to 10-bit
+            expr = expr.replace("235,", "940,").replace("96,", "384,").replace("170)", "680)")
+        return f"[0:v][1:v]xfade=transition=custom:duration={td:.3f}:offset=0:expr='{expr}',format={pix_fmt}[v]"
+    return f"[0:v][1:v]xfade=transition={name}:duration={td:.3f}:offset=0,format={pix_fmt}[v]"
 
 
 _HAS_AUDIO_CACHE: Dict[str, bool] = {}
@@ -3048,6 +3130,7 @@ def _build_cut_render_cmd(
     vcodec_args: List[str],
     out_main: str,
     out_handle: str = "",
+    tail_vf: str = "format=yuv420p",
 ) -> List[str]:
     """
     One ffmpeg command for a cut (video or photo slide). With handle > 0 (video only) it also writes
@@ -3077,7 +3160,8 @@ def _build_cut_render_cmd(
     v = f"[0:v]{pre_vf}{scale_pad_vf}{post_vf}"
     if hud_idx is not None:
         v += f"[base];[base][{hud_idx}:v]overlay=0:0:format=auto"
-    v += f"{fade_out_v},format=yuv420p"
+    # tail_vf: final pixel format, plus the SDR -> HLG conversion when the master is HLG
+    v += f"{fade_out_v},{tail_vf}"
     if split_h:
         v += (
             f",split=2[vf1][vf2];[vf1]trim=end={dur:.3f},setpts=PTS-STARTPTS[v];"
@@ -3124,6 +3208,7 @@ def _join_cut(
     trans: str,
     td: float,
     vcodec_args: List[str],
+    pix_fmt: str = "yuv420p",
 ) -> Tuple[str, float, float]:
     """
     Blend the previous cut's tail into raw_seg over raw_seg's first seconds (the timeline length is
@@ -3138,7 +3223,7 @@ def _join_cut(
         return "none", 0.0, 0.0
     graph = []
     if use_v:
-        graph.append(_xfade_video_graph(trans, td))
+        graph.append(_xfade_video_graph(trans, td, pix_fmt))
     if use_a:
         # Linear (constant-gain) fades: the BGM is the same signal on both sides and sums back to
         # its level exactly, while the dialogue dips at most ~3 dB for a quarter second.
@@ -3322,6 +3407,7 @@ def run_autocut_pipeline(
     manual_order: Optional[List[str]] = None,
     clip_rotations: Optional[Dict[str, int]] = None,
     max_edit_ratio: float = 0.6,
+    output_dynamic_range: str = "sdr",
     log_fn: Callable[[str], None] = print,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     stop_check_fn: Optional[Callable[[], bool]] = None,
@@ -3331,6 +3417,8 @@ def run_autocut_pipeline(
     manual_order: file paths in the order arranged on the GUI timeline (None = shooting-time order).
     clip_rotations: {file path: clockwise degrees (90/180/270)} set by hand on the timeline.
     max_edit_ratio: edited video length cap as a share of the original video length (0.6 = 60%; >= 1 = no cap).
+    output_dynamic_range: "sdr" (Rec.709 8-bit, HDR clips tone-mapped) or "hlg" (BT.2020 10-bit HEVC HLG master:
+        HLG clips kept, PQ converted, SDR clips/photos/intro placed at the 203-nit HDR reference white).
     Models:
       1) Faster-Whisper large-v3-turbo (Speech & VAD)
       2) CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5)
@@ -3349,7 +3437,12 @@ def run_autocut_pipeline(
     out_fps = float(out_fps)
     video_bitrate_bps = max(1_000_000, int(video_bitrate_bps))
     fps_expr = _fps_to_ffmpeg_expr(out_fps)
-    vcodec_args = _build_vcodec_args(video_codec, video_bitrate_bps)
+    out_dr = "hlg" if str(output_dynamic_range).lower() == "hlg" else "sdr"
+    if out_dr == "hlg" and not ("hevc" in video_codec.lower() or "265" in video_codec.lower()):
+        log_fn("ℹ️ HLG 출력은 HEVC(H.265) 10-bit만 지원하므로 압축 코덱을 HEVC로 바꿉니다.")
+        video_codec = "hevc_nvenc"
+    out_pix = output_pix_fmt(out_dr)
+    vcodec_args = _build_vcodec_args(video_codec, video_bitrate_bps, out_dr)
     scale_pad_vf = (
         f"scale={out_width}:{out_height}:force_original_aspect_ratio=decrease,"
         f"pad={out_width}:{out_height}:(ow-iw)/2:(oh-ih)/2,fps={fps_expr}"
@@ -3375,7 +3468,8 @@ def run_autocut_pipeline(
     )
     log_fn(
         f"⚙️ 출력 인코딩 설정: 해상도 {out_width}x{out_height} | {out_fps:g}fps | "
-        f"화질 {video_bitrate_bps:,} bps ({video_bitrate_bps/1_000_000:.1f} Mbps) | 압축 코덱: {codec_label}"
+        f"화질 {video_bitrate_bps:,} bps ({video_bitrate_bps/1_000_000:.1f} Mbps) | 압축 코덱: {codec_label} | "
+        f"다이내믹 레인지: {OUTPUT_DR_LABELS[out_dr]}"
     )
     log_fn(f"🎞️ 영상 편집 모드: {edit_mode} | 인트로 스타일: {intro_style} | 컬러 프로파일(DJI/D-Log): {color_profile}")
 
@@ -3403,9 +3497,16 @@ def run_autocut_pipeline(
     dr_counts: Dict[str, int] = defaultdict(int)
     for vp in video_files:
         dr_counts[detect_dynamic_range(vp)["range"]] += 1
-    if dr_counts.get("HLG") or dr_counts.get("HDR10"):
-        backend = _hdr_tonemap_backend()
-        backend_label = "libplacebo GPU(Vulkan)" if backend == "libplacebo" else "zscale CPU"
+    backend_label = "libplacebo GPU(Vulkan)" if _hdr_tonemap_backend() == "libplacebo" else "zscale CPU"
+    if out_dr == "hlg":
+        log_fn(
+            f"🌈 HLG HDR 마스터: SDR {dr_counts.get('SDR', 0)}개·사진·인트로는 HDR 기준 백색(203nit)으로 변환, "
+            f"HLG {dr_counts.get('HLG', 0)}개는 그대로, HDR10/PQ {dr_counts.get('HDR10', 0)}개는 HLG로 변환 ({backend_label})"
+        )
+        if burn_subtitles:
+            log_fn("ℹ️ HLG 출력에서는 자막 입히기를 건너뜁니다 (흰 글자가 HDR 최대 밝기로 보임) — 자막은 SRT로 제공")
+            burn_subtitles = False
+    elif dr_counts.get("HLG") or dr_counts.get("HDR10"):
         log_fn(
             f"🌈 HDR 자동 감지: SDR {dr_counts.get('SDR', 0)}개 · HLG {dr_counts.get('HLG', 0)}개 · "
             f"HDR10/PQ {dr_counts.get('HDR10', 0)}개 -> 출력은 SDR(Rec.709 8-bit)로 통일, HDR 클립은 {backend_label} 톤매핑"
@@ -3661,6 +3762,14 @@ def run_autocut_pipeline(
                 out_width=out_width,
                 out_height=out_height,
             )
+        # HLG master, HDR-source clips: the HUD is composited directly onto HLG pixels, so dim it to the
+        # HLG reference white (~75% signal) instead of full-scale white (= the HDR peak)
+        hud_png_hdr = os.path.join(tmpdir, "hud_overlay_hlg.png")
+        if enable_hud and out_dr == "hlg" and os.path.exists(hud_png):
+            with Image.open(hud_png) as hud_im:
+                r, g, b, a = hud_im.convert("RGBA").split()
+                dim = lambda ch: ch.point(lambda v: int(v * 0.75))
+                Image.merge("RGBA", (dim(r), dim(g), dim(b), a)).save(hud_png_hdr)
 
         # Tail of the previous segment that the next cut dissolves out of: a real-footage handle
         # (with audio) after a video cut, or a still of the last frame after the intro / a photo.
@@ -3699,6 +3808,7 @@ def run_autocut_pipeline(
                 video_bitrate_bps=video_bitrate_bps,
                 video_codec=video_codec,
                 intro_style=intro_style,
+                output_dr=out_dr,
             )
             bgm_cursor = intro_dur
             seg_files.append(intro_mp4)
@@ -3713,6 +3823,7 @@ def run_autocut_pipeline(
                     out_fps=out_fps,
                     video_bitrate_bps=video_bitrate_bps,
                     video_codec=video_codec,
+                    output_dr=out_dr,
                 ):
                     prev_tail_mp4, prev_tail_dur = tail_path, INTRO_TAIL_SEC
         else:
@@ -3755,6 +3866,9 @@ def run_autocut_pipeline(
                 plans.append(("none", 0.0))
             else:
                 plans.append(plan_transition(flat_cuts[i - 1] if i else None, cut, edit_mode, trans_style, trans_prob, rng))
+        if out_dr == "hlg":
+            # A dip to full-scale white is a flash at the HDR peak (~1000 nits) on an HLG display
+            plans = [("fadeblack", td) if name == "fadewhite" else (name, td) for name, td in plans]
         plan_counts: Dict[str, int] = defaultdict(int)
         for name, _ in plans:
             plan_counts[TRANSITION_LABELS_KO.get(name, name)] += 1
@@ -3780,24 +3894,44 @@ def run_autocut_pipeline(
             hdr_hw_args: List[str] = []
             decode_args: List[str] = ["-hwaccel", "auto"]
             hdr_head = ""
+            # tail_vf finishes the graph in the master's format: 8-bit SDR, or for an HLG master the
+            # SDR -> HLG conversion (SDR sources) / just 10-bit (HDR sources, already HLG at that point)
+            tail_hw, tail_vf = sdr_to_output_vf(out_dr)
+            clip_hud = hud_png
             if ctype == "video":
                 if fpath not in color_filter_cache:
                     cf_str = get_color_profile_filter(color_profile, fpath, log_fn=log_fn)
                     color_filter_cache[fpath] = f",{cf_str}" if cf_str else ""
                 clip_eq_chain = color_filter_cache[fpath] + eq_chain
+                dr = detect_dynamic_range(fpath)
                 if fpath not in hdr_cache:
-                    dr = detect_dynamic_range(fpath)
-                    hdr_cache[fpath] = get_hdr_tonemap_vf(dr)
-                    if hdr_cache[fpath][1]:
-                        log_fn(f"  🌈 [{fname}] {dr['label']} HDR 감지 -> SDR(Rec.709) 톤매핑 적용")
+                    if out_dr == "hlg":
+                        hdr_cache[fpath] = hdr_to_hlg_vf(dr)
+                        if dr["range"] != "SDR":
+                            log_fn(
+                                f"  🌈 [{fname}] {dr['label']} HDR 감지 -> "
+                                + ("HLG로 변환" if dr["range"] == "HDR10" else "HLG 그대로 유지")
+                            )
+                    else:
+                        hdr_cache[fpath] = get_hdr_tonemap_vf(dr)
+                        if hdr_cache[fpath][1]:
+                            log_fn(f"  🌈 [{fname}] {dr['label']} HDR 감지 -> SDR(Rec.709) 톤매핑 적용")
                 hdr_hw_args, tm_vf = hdr_cache[fpath]
-                # Source-side filters before scaling: HDR tone map, then the manual timeline rotation
+                if out_dr == "hlg" and dr["range"] != "SDR":
+                    # HDR source into an HLG master: stays HDR end to end. The 8-bit-only style/eq filters
+                    # would band 10-bit footage, so they are skipped; the HUD uses the dimmed copy.
+                    clip_eq_chain = ""
+                    tail_hw, tail_vf = [], f"format={out_pix}"
+                    clip_hud = hud_png_hdr
+                # Source-side filters before scaling: HDR tone map / PQ->HLG, then the manual timeline rotation
                 hdr_head = "".join(f"{f}," for f in (tm_vf, rotation_vf(clip.get("rotation", 0))) if f)
-                # "-hwaccel auto" with a Vulkan device present picks a decoder that yields solid-blue frames
-                # for 10-bit HLG/DV clips through libplacebo; software decode is correct and just as fast here
-                decode_args = [] if hdr_hw_args else ["-hwaccel", "auto"]
             else:
                 clip_eq_chain = eq_chain
+            hdr_hw_args = hdr_hw_args or tail_hw
+            if hdr_hw_args and ctype == "video":
+                # "-hwaccel auto" with a Vulkan device present picks a decoder that yields solid-blue frames
+                # for 10-bit HLG/DV clips through libplacebo; NVDEC (or software) is correct
+                decode_args = _libplacebo_decode_args()
 
             # Handle: real footage after this cut's out point, long enough for the next dissolve and the
             # audio crossfade, limited by what the source still has (none for photos / the last cut)
@@ -3860,7 +3994,7 @@ def run_autocut_pipeline(
                 pre_vf=pre_vf,
                 scale_pad_vf=scale_pad_vf,
                 post_vf=post_vf,
-                hud_png=hud_png if (enable_hud and os.path.exists(hud_png)) else "",
+                hud_png=clip_hud if (enable_hud and os.path.exists(clip_hud)) else "",
                 bgm_file=bgm_file if has_bgm else "",
                 bgm_ss=bgm_ss,
                 bgm_vol=bgm_video_vol,
@@ -3872,6 +4006,7 @@ def run_autocut_pipeline(
                 vcodec_args=vcodec_args,
                 out_main=raw_seg,
                 out_handle=handle_seg,
+                tail_vf=tail_vf,
             )
             res = subprocess.run(cmd_raw, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if res.returncode != 0:
@@ -3888,6 +4023,7 @@ def run_autocut_pipeline(
                 trans_in,
                 td_in,
                 vcodec_args,
+                pix_fmt=out_pix,
             )
             used_counts[TRANSITION_LABELS_KO.get(used, used)] += 1
 
@@ -3905,6 +4041,7 @@ def run_autocut_pipeline(
                         out_fps=out_fps,
                         video_bitrate_bps=video_bitrate_bps,
                         video_codec=video_codec,
+                        output_dr=out_dr,
                     ):
                         prev_tail_mp4, prev_tail_dur = still_tail, max(0.2, next_td)
             try:
@@ -4004,6 +4141,7 @@ def run_autocut_pipeline(
             progress_fn(100.0, f"완료! 원본 {total_orig_sec/60:.1f}분 -> 편집본 {final_edit_sec/60:.1f}분")
 
         analysis_summary["output_dir"] = output_dir
+        analysis_summary["output_dynamic_range"] = out_dr
         analysis_summary["subbed_mp4"] = subbed_mp4 if burn_subtitles else ""
         analysis_summary["clean_mp4"] = clean_mp4 if export_filmora_clean else ""
         analysis_summary["srt_full"] = srt_full

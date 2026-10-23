@@ -4,6 +4,17 @@ All notable changes to **AutoCut Studio 2026** are automatically versioned and t
 
 ---
 
+## [v2.8.0] - 2026-10-23
+### 🌈 HLG HDR 출력 옵션 · 작업 폴더에 저장 파일 생성
+- **출력 다이내믹 레인지 선택**: `SDR (기본 · Rec.709 8-bit)` / `HLG HDR (BT.2020 10-bit · HEVC)`.
+  - HLG 마스터: HEVC Main10 + VUI(BT.2020 / ARIB STD-B67 / BT.2020nc). HLG 원본은 그대로, HDR10(PQ)은 HLG로 변환, SDR 영상·사진·인트로는 SDR 그래프 끝에서 HDR 기준 백색(203nit ≈ HLG 75%)으로 변환 (`libplacebo`, CPU 대체는 `zscale npl=203`).
+  - 실측: HLG 마스터를 HDR 화면처럼 다시 SDR로 보면 SDR 마스터와 밝기 일치 (인트로 135 vs 139, 아이폰 122 vs 123).
+  - HDR 원본 클립에는 8-bit 전용 `eq` 스타일 보정 생략, HUD는 75%로 낮춘 사본 사용, 화이트 딥 → 블랙 딥(HDR 최대 밝기 섬광 방지), 라이트 릭은 10-bit 값, 자막 입히기는 생략(SRT 제공), H.264 선택 시 HEVC로 전환.
+  - libplacebo를 쓰는 디코딩은 `-hwaccel auto` 대신 NVDEC(`cuda`, 없으면 소프트웨어) 사용.
+- **작업 폴더에 저장 파일**: `Ctrl+S`/`작업 상태 저장` 시 작업 폴더에 `AutoCut_작업저장.autocut.json`(설정 + 모든 날짜 폴더 타임라인) 생성. `폴더 찾기`로 그 폴더를 고르면 불러올지 확인, 메뉴 `작업 폴더의 저장 파일 불러오기` 추가. 폴더가 옮겨져도 그 폴더 기준으로 복원.
+
+---
+
 ## [v2.7.1] - 2026-10-21
 ### 🛑 프로그램을 끄면 인코딩도 함께 종료
 - **Windows 작업 개체(Job Object)**: 앱 시작 시 `KILL_ON_JOB_CLOSE` 작업 개체에 들어가, 창 닫기·오류·작업 관리자 강제 종료 등 어떤 이유로 앱이 꺼져도 ffmpeg/ffprobe가 함께 종료됩니다 (실측: 이전엔 부모가 죽어도 ffmpeg 계속 실행 → 이제 함께 종료). 공유 서버인 Ollama는 `CREATE_BREAKAWAY_FROM_JOB`로 제외.
