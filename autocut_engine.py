@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "2.8.1"
+AUTOCUT_VERSION = "2.9.0"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -861,10 +861,25 @@ def _hdr_tonemap_backend() -> str:
     return _TONEMAP_BACKEND
 
 
-def get_hdr_tonemap_vf(dr: Dict[str, str], gpu: bool = True) -> Tuple[List[str], str]:
+def _placebo_adjust_opts(adjust: Optional[Dict[str, float]]) -> str:
+    """libplacebo color-adjustment options (brightness/contrast/saturation/gamma) from an auto color result."""
+    if not adjust:
+        return ""
+    out = ""
+    for key, neutral in (("brightness", 0.0), ("contrast", 1.0), ("saturation", 1.0), ("gamma", 1.0)):
+        v = float(adjust.get(key, neutral))
+        if abs(v - neutral) > 1e-3:
+            out += f":{key}={v:.3f}"
+    return out
+
+
+def get_hdr_tonemap_vf(
+    dr: Dict[str, str], gpu: bool = True, adjust: Optional[Dict[str, float]] = None
+) -> Tuple[List[str], str]:
     """
     Return (extra_ffmpeg_input_args, filter_chain) converting an HDR clip to 8-bit SDR Rec.709.
     SDR clips return ([], ""). gpu=False forces the CPU zscale path (cheap for tiny analysis frames).
+    adjust: per-clip auto color balance (libplacebo path only).
     """
     if not dr or dr.get("range", "SDR") == "SDR":
         return [], ""
@@ -873,6 +888,7 @@ def get_hdr_tonemap_vf(dr: Dict[str, str], gpu: bool = True) -> Tuple[List[str],
         return list(_LIBPLACEBO_HW_ARGS), (
             f"setparams=color_primaries=bt2020:color_trc={trc}:colorspace=bt2020nc,"
             "libplacebo=tonemapping=auto:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=yuv420p"
+            + _placebo_adjust_opts(adjust)
         )
     return [], (
         f"zscale=tin={trc}:pin=bt2020:min=bt2020nc:t=linear:p=bt2020:npl=203,format=gbrpf32le,"
@@ -905,14 +921,21 @@ def sdr_to_output_vf(output_dr: str = "sdr") -> Tuple[List[str], str]:
     )
 
 
-def hdr_to_hlg_vf(dr: Dict[str, str]) -> Tuple[List[str], str]:
-    """(extra input args, filter) bringing an HDR clip into HLG for an HLG master: HLG stays as is, PQ is converted."""
-    if not dr or dr.get("range") != "HDR10":
+def hdr_to_hlg_vf(dr: Dict[str, str], adjust: Optional[Dict[str, float]] = None) -> Tuple[List[str], str]:
+    """
+    (extra input args, filter) bringing an HDR clip into HLG for an HLG master: HLG stays as is (or gets only the
+    auto color balance, HLG -> HLG), PQ is converted.
+    """
+    if not dr or dr.get("range", "SDR") == "SDR":
+        return [], ""
+    adj = _placebo_adjust_opts(adjust) if _hdr_tonemap_backend() == "libplacebo" else ""
+    if dr.get("range") != "HDR10" and not adj:
         return [], ""
     if _hdr_tonemap_backend() == "libplacebo":
         return list(_LIBPLACEBO_HW_ARGS), (
-            "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,"
+            f"setparams=color_primaries=bt2020:color_trc={dr.get('trc', 'arib-std-b67')}:colorspace=bt2020nc,"
             "libplacebo=colorspace=bt2020nc:color_primaries=bt2020:color_trc=arib-std-b67:range=tv:format=yuv420p10le"
+            + adj
         )
     return [], (
         "zscale=tin=smpte2084:pin=bt2020:min=bt2020nc:t=linear:npl=203,format=gbrpf32le,"
@@ -1357,6 +1380,211 @@ def release_aesthetic_vlm_engine():
         _GLOBAL_AESTHETIC_VLM_ENGINE.close()
         _GLOBAL_AESTHETIC_VLM_ENGINE = None
     _release_cuda_vram()
+
+
+# ==============================================================================
+# HDR auto color balance (per clip): measured candidates judged by the CLIP aesthetic model
+# ==============================================================================
+
+AUTO_COLOR_VERSION = 1
+_AC_W, _AC_H = 320, 180
+# Display-referred targets (8-bit SDR view of the clip, i.e. what an HDR TV shows after its own mapping)
+_AC_BLACK_P2 = 12.0  # 2nd-percentile luma: deep but not crushed blacks (iPhone HLG measures ~8)
+_AC_SAT_TARGET = 65.0  # mean HSV saturation (iPhone HLG ~75, Osmo Pocket 3 HLG ~25-65)
+_AC_MEAN_TARGET = 118.0
+_AC_TONE_GRID = [(b, c) for b in (0.0, -0.04, -0.08, -0.12) for c in (1.0, 1.1, 1.2)]
+
+
+def _ac_sample_frames(path: str, duration: float, out_mkv: str, n: int = 6) -> bool:
+    """n evenly spaced keyframes (only keyframes are decoded, <1 s per clip) as a tiny 10-bit FFV1 file."""
+    step = max(0.5, float(duration or 0) / (n + 1))
+    cmd = [
+        "ffmpeg", "-y", "-v", "error", "-discard", "nokey", "-i", path,
+        "-vf", f"select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,{step:.2f})',scale={_AC_W}:{_AC_H},format=yuv420p10le",
+        "-fps_mode", "passthrough", "-frames:v", str(n), "-c:v", "ffv1", out_mkv,
+    ]
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 and os.path.exists(out_mkv)
+
+
+def _ac_render(tiny_mkv: str, trc: str, cands: List[Dict[str, float]]) -> List[np.ndarray]:
+    """Render every candidate adjustment through libplacebo's HDR->SDR view in one ffmpeg run.
+    Returns one (frames, H, W, 3) RGB array per candidate."""
+    k = len(cands)
+    graph = f"[0:v]setparams=color_primaries=bt2020:color_trc={trc}:colorspace=bt2020nc,split={k}" + "".join(f"[s{i}]" for i in range(k)) + ";"
+    for i, adj in enumerate(cands):
+        graph += (
+            f"[s{i}]libplacebo=tonemapping=auto:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=yuv420p"
+            f"{_placebo_adjust_opts(adj)}[o{i}];"
+        )
+    graph += "".join(f"[o{i}]" for i in range(k)) + (f"hstack=inputs={k}[v]" if k > 1 else "null[v]")
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", *_LIBPLACEBO_HW_ARGS, "-i", tiny_mkv, "-filter_complex", graph, "-map", "[v]",
+         "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        capture_output=True,
+    ).stdout
+    if not raw:
+        return []
+    frames = np.frombuffer(raw, np.uint8).reshape(-1, _AC_H, _AC_W * k, 3)
+    return [frames[:, :, i * _AC_W : (i + 1) * _AC_W, :] for i in range(k)]
+
+
+def _ac_stats(rgb: np.ndarray) -> Dict[str, float]:
+    lum = np.stack([cv2.cvtColor(f, cv2.COLOR_RGB2GRAY) for f in rgb]).astype(np.float32)
+    sat = np.stack([cv2.cvtColor(f, cv2.COLOR_RGB2HSV)[:, :, 1] for f in rgb]).astype(np.float32)
+    return {
+        "mean": float(lum.mean()),
+        "p2": float(np.percentile(lum, 2)),
+        "p98": float(np.percentile(lum, 98)),
+        "sat": float(sat.mean()),
+        "clip": float((lum > 250).mean() * 100),
+    }
+
+
+def analyze_auto_color(path: str, duration: float, dr: Dict[str, str], workdir: str, engine=None) -> Optional[Dict]:
+    """
+    Pick per-clip libplacebo adjustments (brightness / contrast / saturation / gamma) for an HDR clip.
+      1) tone: 12 brightness x contrast candidates, chosen to bring lifted blacks down to a deep-but-not-crushed
+         level without clipping highlights, keeping overall brightness near the target
+      2) color & exposure: saturation (aimed at a common target, so clips match) x gamma, plus the untouched
+         original, each scored by the CLIP aesthetic model (LAION-Aesthetics) minus penalties for drifting off the
+         brightness target, clipping or over-saturating — the original competes too, so it never gets worse.
+    One set of values per clip (no flicker); everything is measured on the actual libplacebo output.
+    """
+    if _hdr_tonemap_backend() != "libplacebo" or dr.get("range", "SDR") == "SDR":
+        return None
+    trc = dr.get("trc", "arib-std-b67")
+    tiny = os.path.join(workdir, f"ac_{abs(hash(path)) % 10**8}.mkv")
+    if not _ac_sample_frames(path, duration, tiny):
+        return None
+    try:
+        neutral = {"brightness": 0.0, "contrast": 1.0, "saturation": 1.0, "gamma": 1.0}
+        tone_cands = [dict(neutral, brightness=b, contrast=c) for b, c in _AC_TONE_GRID]
+        outs = _ac_render(tiny, trc, tone_cands)
+        if not outs:
+            return None
+        base = _ac_stats(outs[0])
+        mean_target = float(np.clip(0.5 * base["mean"] + 0.5 * _AC_MEAN_TARGET, 95.0, 135.0))
+
+        def tone_cost(st):
+            return (
+                abs(st["p2"] - _AC_BLACK_P2) / 6.0
+                + max(0.0, st["p98"] - 240.0) / 5.0
+                + max(0.0, st["clip"] - max(1.5, base["clip"] + 0.5)) * 2.0
+                + abs(st["mean"] - mean_target) / 25.0
+            )
+
+        tone_stats = [_ac_stats(o) for o in outs]
+        best_tone = tone_cands[int(np.argmin([tone_cost(s) for s in tone_stats]))]
+        sat_now = tone_stats[tone_cands.index(best_tone)]["sat"]
+        s0 = float(np.clip((_AC_SAT_TARGET / max(10.0, sat_now)) ** 0.8, 1.0, 1.7))
+        color_cands = [neutral] + [
+            dict(best_tone, saturation=round(float(np.clip(s, 1.0, 1.8)), 3), gamma=g)
+            for s in (s0 * 0.85, s0, s0 * 1.15)
+            for g in (0.92, 1.0, 1.08)
+        ]
+        outs2 = _ac_render(tiny, trc, color_cands)
+        if not outs2:
+            return None
+        stats2 = [_ac_stats(o) for o in outs2]
+        aes = []
+        for o in outs2:
+            if engine is not None:
+                try:
+                    sc, _, _ = engine.score_bgr_frames_and_caption([cv2.cvtColor(f, cv2.COLOR_RGB2BGR) for f in o], use_vlm=False)
+                    aes.append(float(np.mean(sc)) if sc else 5.0)
+                    continue
+                except Exception:
+                    pass
+            aes.append(5.0)
+
+        def objective(i):
+            st = stats2[i]
+            return (
+                aes[i]
+                - abs(st["mean"] - mean_target) / 30.0
+                - max(0.0, st["clip"] - max(1.5, base["clip"] + 0.5))
+                - max(0.0, st["sat"] - 85.0) / 8.0
+                - abs(st["p2"] - _AC_BLACK_P2) / 40.0
+            )
+
+        best = int(np.argmax([objective(i) for i in range(len(color_cands))]))
+        res = dict(color_cands[best])
+        res.update(
+            {
+                "v": AUTO_COLOR_VERSION,
+                "before": {k: round(v, 1) for k, v in base.items()},
+                "after": {k: round(v, 1) for k, v in stats2[best].items()},
+                "aes_before": round(aes[0], 2),
+                "aes_after": round(aes[best], 2),
+            }
+        )
+        return res
+    finally:
+        try:
+            os.remove(tiny)
+        except OSError:
+            pass
+
+
+def ensure_auto_color(
+    clips_meta: List[Dict],
+    cache_path: str,
+    workdir: str,
+    log_fn: Callable[[str], None] = print,
+    progress_fn: Optional[Callable[[float, str], None]] = None,
+) -> Dict[str, Dict]:
+    """Auto color values for every HDR video clip in the edit, cached per file (path, size, mtime) in cache_path."""
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+    result: Dict[str, Dict] = {}
+    todo = []
+    for c in clips_meta:
+        if c.get("type", "video") != "video" or not c.get("kept_intervals"):
+            continue
+        p = c.get("path", "")
+        if not os.path.exists(p):
+            continue
+        dr = detect_dynamic_range(p)
+        if dr["range"] == "SDR":
+            continue
+        st = os.stat(p)
+        key = f"{os.path.basename(p)}|{st.st_size}|{int(st.st_mtime)}"
+        hit = cache.get(key)
+        if hit and hit.get("v") == AUTO_COLOR_VERSION:
+            result[p] = hit
+        else:
+            todo.append((c, p, dr, key))
+    if todo:
+        if _hdr_tonemap_backend() != "libplacebo":
+            log_fn("ℹ️ 자동 색 균형은 libplacebo(Vulkan)가 필요해 건너뜁니다.")
+            return result
+        log_fn(f"🎨 HDR 자동 색 균형 분석: {len(todo)}개 클립 (CLIP 미학 점수로 밝기·검정·채도 후보 선택, 결과는 캐시)")
+        engine = get_aesthetic_vlm_engine(log_fn=log_fn)
+        for i, (c, p, dr, key) in enumerate(todo, 1):
+            if progress_fn:
+                progress_fn(46.0, f"HDR 자동 색 균형 분석 중 ({i}/{len(todo)}): {os.path.basename(p)}")
+            res = analyze_auto_color(p, float(c.get("duration", 0.0) or 0.0), dr, workdir, engine=engine)
+            if res:
+                cache[key] = res
+                result[p] = res
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+    if result:
+        b = np.mean([r["before"]["sat"] for r in result.values()])
+        a = np.mean([r["after"]["sat"] for r in result.values()])
+        bb = np.mean([r["before"]["p2"] for r in result.values()])
+        ab = np.mean([r["after"]["p2"] for r in result.values()])
+        log_fn(
+            f"🎨 자동 색 균형 적용: HDR 클립 {len(result)}개 · 평균 채도 {b:.0f}→{a:.0f} · 검정(하위 2%) {bb:.0f}→{ab:.0f} "
+            f"· 미학 점수 {np.mean([r['aes_before'] for r in result.values()]):.2f}→{np.mean([r['aes_after'] for r in result.values()]):.2f}"
+        )
+    return result
 
 
 def detect_shot_boundaries_from_bgr_stream(
@@ -2051,15 +2279,22 @@ def find_best_shot_frame(
             try:
                 manual_rot = int(clip.get("rotation", 0) or 0) % 360
                 if ctype == "video":
-                    _, hdr_tm = get_hdr_tonemap_vf(detect_dynamic_range(fpath), gpu=False)
+                    adj = clip.get("auto_color")
+                    if adj:
+                        # Auto-color-balanced HDR clip: judge (and later show in the intro) the corrected look
+                        hdr_hw, hdr_tm = get_hdr_tonemap_vf(detect_dynamic_range(fpath), gpu=True, adjust=adj)
+                        dec = _libplacebo_decode_args() if hdr_hw else ["-hwaccel", "auto"]
+                    else:
+                        _, hdr_tm = get_hdr_tonemap_vf(detect_dynamic_range(fpath), gpu=False)
+                        hdr_hw, dec = [], ["-hwaccel", "auto"]
                     rot_vf = rotation_vf(manual_rot)
                     cmd = [
                         "ffmpeg",
                         "-y",
                         "-v",
                         "error",
-                        "-hwaccel",
-                        "auto",
+                        *hdr_hw,
+                        *dec,
                         "-ss",
                         f"{t_val:.2f}",
                         "-i",
@@ -3408,6 +3643,7 @@ def run_autocut_pipeline(
     clip_rotations: Optional[Dict[str, int]] = None,
     max_edit_ratio: float = 0.6,
     output_dynamic_range: str = "sdr",
+    auto_color_balance: bool = True,
     log_fn: Callable[[str], None] = print,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     stop_check_fn: Optional[Callable[[], bool]] = None,
@@ -3419,6 +3655,7 @@ def run_autocut_pipeline(
     max_edit_ratio: edited video length cap as a share of the original video length (0.6 = 60%; >= 1 = no cap).
     output_dynamic_range: "sdr" (Rec.709 8-bit, HDR clips tone-mapped) or "hlg" (BT.2020 10-bit HEVC HLG master:
         HLG clips kept, PQ converted, SDR clips/photos/intro placed at the 203-nit HDR reference white).
+    auto_color_balance: per-clip HDR brightness/black/saturation balance picked with the CLIP aesthetic model.
     Models:
       1) Faster-Whisper large-v3-turbo (Speech & VAD)
       2) CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5)
@@ -3777,6 +4014,20 @@ def run_autocut_pipeline(
         prev_tail_dur = 0.0
         prev_tail_has_audio = False
 
+        # HDR auto color balance (per clip, cached next to the analysis report). Runs while the CLIP model is
+        # loaded for the best-shot search anyway; the values also feed the best shot so the intro matches.
+        auto_color_map: Dict[str, Dict] = {}
+        if auto_color_balance:
+            auto_color_map = ensure_auto_color(
+                clips_meta,
+                os.path.join(output_dir, f"{date_name}_자동색보정.json"),
+                tmpdir,
+                log_fn=log_fn,
+                progress_fn=progress_fn,
+            )
+        for c in clips_meta:
+            c["auto_color"] = auto_color_map.get(c.get("path", ""))
+
         if enable_intro:
             if progress_fn:
                 progress_fn(47.0, "베스트 샷 탐색(CLIP Aesthetic V2.5) 및 3초 인트로 타이틀 생성 중...")
@@ -3905,17 +4156,24 @@ def run_autocut_pipeline(
                 clip_eq_chain = color_filter_cache[fpath] + eq_chain
                 dr = detect_dynamic_range(fpath)
                 if fpath not in hdr_cache:
+                    adj = auto_color_map.get(fpath)
+                    adj_txt = (
+                        f" + 자동 색 균형(검정 {adj['brightness']:+.2f} · 대비 x{adj['contrast']:.2f} · 채도 x{adj['saturation']:.2f} · 감마 {adj['gamma']:.2f})"
+                        if adj
+                        else ""
+                    )
                     if out_dr == "hlg":
-                        hdr_cache[fpath] = hdr_to_hlg_vf(dr)
+                        hdr_cache[fpath] = hdr_to_hlg_vf(dr, adjust=adj)
                         if dr["range"] != "SDR":
                             log_fn(
                                 f"  🌈 [{fname}] {dr['label']} HDR 감지 -> "
                                 + ("HLG로 변환" if dr["range"] == "HDR10" else "HLG 그대로 유지")
+                                + adj_txt
                             )
                     else:
-                        hdr_cache[fpath] = get_hdr_tonemap_vf(dr)
+                        hdr_cache[fpath] = get_hdr_tonemap_vf(dr, adjust=adj)
                         if hdr_cache[fpath][1]:
-                            log_fn(f"  🌈 [{fname}] {dr['label']} HDR 감지 -> SDR(Rec.709) 톤매핑 적용")
+                            log_fn(f"  🌈 [{fname}] {dr['label']} HDR 감지 -> SDR(Rec.709) 톤매핑 적용{adj_txt}")
                 hdr_hw_args, tm_vf = hdr_cache[fpath]
                 if out_dr == "hlg" and dr["range"] != "SDR":
                     # HDR source into an HLG master: stays HDR end to end. The 8-bit-only style/eq filters

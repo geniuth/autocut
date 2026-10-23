@@ -81,6 +81,8 @@ flowchart TD
   * 옆으로·거꾸로 찍힌 클립은 타임라인에서 `R` / `Shift+R` / 우클릭(180°)으로 돌립니다. 영상은 `transpose`, 사진은 회전 후 블러 배경을 다시 만들며, 수동 회전한 클립은 자동 상하반전 보정을 건너뜁니다.
 * **HDR 자동 감지 & SDR 톤매핑 (`detect_dynamic_range`, `get_hdr_tonemap_vf`, v2.3.0)**:
   * HLG(아이폰 Dolby Vision 8.4 포함)·HDR10/HDR10+ 클립을 감지해 `libplacebo`(Vulkan GPU, 없으면 `zscale` CPU)로 Rec.709 SDR에 맞춥니다. BT.709 색 태그를 비트스트림에 기록합니다.
+* **HDR 자동 색 균형 (`analyze_auto_color`, `ensure_auto_color`, v2.9.0)**:
+  * HDR 클립마다 키프레임 6장(키프레임만 디코딩, 1초 미만) → ① 검정(brightness)×대비 12개 후보를 libplacebo HDR→SDR 보기로 렌더링해 하위 2% 휘도≈12·하이라이트 미클리핑·밝기 목표로 선택 → ② 채도(목표 65로 수렴)×감마 9개 + 원본을 CLIP 미학 점수 − 벗어남 벌점으로 선택. 클립당 고정값(깜빡임 없음), `<날짜>_자동색보정.json` 캐시, HLG 출력은 HLG→HLG libplacebo로 적용(실측: 예상치와 출력 일치), 인트로 베스트샷에도 반영. libplacebo가 없으면 건너뜀.
 * **출력 다이내믹 레인지 선택 (`output_dynamic_range`, `sdr_to_output_vf`, `hdr_to_hlg_vf`, v2.8.0)**:
   * **SDR(기본)** 또는 **HLG HDR**(HEVC Main10 · BT.2020 · ARIB STD-B67). HLG에서는 SDR 영상·사진·인트로를 SDR 그래프 끝에서 HDR 기준 백색 203nit로 변환하고(실측: HDR TV처럼 다시 보면 SDR 마스터와 밝기 일치), HLG 원본은 그대로, PQ는 HLG로 변환합니다. HDR 원본에는 8-bit 전용 `eq`를 생략하고 날짜/로고 HUD를 75%로 낮춰 합성, 화이트 딥→블랙 딥, 라이트 릭은 10-bit 값으로, 자막 입히기는 생략(SRT 제공).
 

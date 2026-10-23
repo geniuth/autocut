@@ -5,7 +5,7 @@
 
 - **Author GitHub**: [https://github.com/geniuth](https://github.com/geniuth)
 - **Repository**: [https://github.com/geniuth/autocut](https://github.com/geniuth/autocut)
-- **Current Version**: `v2.8.1` — 변경 이력은 [CHANGELOG.md](CHANGELOG.md) 참고 (Semantic Versioning)
+- **Current Version**: `v2.9.0` — 변경 이력은 [CHANGELOG.md](CHANGELOG.md) 참고 (Semantic Versioning)
 
 ---
 
@@ -69,6 +69,13 @@ flowchart LR
 4. 그래도 넘으면 점수 낮은 영상부터 제외 (말소리 없는 영상 먼저)
 
 점수 = 말소리 비율 × 3 + 미학 점수 + VLM 하이라이트 점수. 분석 리포트에는 원래 선택 구간이 그대로 남아, 상한을 바꿔 다시 돌리면 원본 분석에서 다시 계산합니다.
+
+### 🎨 HDR 자동 색 균형 (v2.9.0 · 기본 켜짐)
+오즈모 포켓3 등 HLG로 찍은 영상은 검정이 떠서 뿌옇고 채도가 낮으며 클립마다 밝기·채도가 들쭉날쭉한 경우가 많습니다 (실측: 오즈모 HLG 채도 25~67·검정 20~39, 아이폰 HLG 채도 75·검정 8). `HDR 영상 자동 색 균형` 옵션은 HDR 클립마다:
+1. 키프레임 6장을 뽑아 **검정 낮추기 × 대비** 후보 12개를 실제로 렌더링해, 검정이 깊지만 뭉개지지 않고 하이라이트가 날아가지 않는 값을 고르고,
+2. **채도(공통 목표치로 맞춤) × 감마** 후보와 원본을 **CLIP 미학 점수(LAION-Aesthetics)**로 채점해 가장 보기 좋은 값을 고릅니다 (원본도 후보라 나빠지지 않음).
+
+클립당 한 가지 값이라 깜빡임이 없고, 목표치가 같아 클립끼리 톤이 맞춰집니다. HDR을 유지한 채 `libplacebo`(brightness·contrast·saturation·gamma)로 적용되어 HLG·SDR 출력 모두에 쓰이고, 인트로 베스트샷에도 반영됩니다. 결과는 `편집결과_<날짜>/<날짜>_자동색보정.json`에 캐시됩니다 (클립당 약 5초, 처음 한 번). 실측(오즈모 포켓3 3클립): 평균 채도 40→60, 검정 32→18, 미학 점수 4.23→4.43, 하이라이트 클리핑 감소.
 
 ---
 

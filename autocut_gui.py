@@ -573,6 +573,7 @@ class AutoCutStudioApp(tk.Tk):
         self.edit_mode = tk.StringVar(value="travel")
         self.whisper_model = tk.StringVar(value="large-v3-turbo")
         self.denoise_audio = tk.BooleanVar(value=True)
+        self.auto_color_balance = tk.BooleanVar(value=True)
         self.include_scene_captions = tk.BooleanVar(value=True)
         # Burning subtitles re-encodes the whole finished video once more, so it is opt-in (SRTs are always written)
         self.burn_subtitles = tk.BooleanVar(value=False)
@@ -920,6 +921,7 @@ class AutoCutStudioApp(tk.Tk):
             "edit_mode": self.edit_mode,
             "whisper_model": self.whisper_model,
             "denoise_audio": self.denoise_audio,
+            "auto_color_balance": self.auto_color_balance,
             "include_scene_captions": self.include_scene_captions,
             "burn_subtitles": self.burn_subtitles,
             "show_log_window": self.show_log_window,
@@ -1421,6 +1423,7 @@ class AutoCutStudioApp(tk.Tk):
             ("상황별 트랜지션(실제 영상 겹침) + 마지막 페이드아웃", self.enable_transitions),
             ("잔잔한 무료 배경음악(BGM) 자동 볼륨 조절 믹싱", self.enable_bgm),
             ("주행·바람 노이즈 제거 및 AI 한국어 음성 자막", self.denoise_audio),
+            ("HDR 영상 자동 색 균형 (AI 미학 점수로 밝기·검정·채도 보정)", self.auto_color_balance),
             ("자막 입힌 완성본도 만들기 (전체 재인코딩 · SRT는 항상 생성)", self.burn_subtitles),
             ("편집 완료 후 결과 폴더 자동으로 열기", self.auto_open_folder_on_done),
         ]
@@ -2167,6 +2170,7 @@ class AutoCutStudioApp(tk.Tk):
                     clip_rotations=clip_rotations,
                     max_edit_ratio=_parse_edit_ratio(self.max_edit_ratio_var.get()),
                     output_dynamic_range=DYNAMIC_RANGE_CHOICES.get(self.dynamic_range_var.get(), "sdr"),
+                    auto_color_balance=self.auto_color_balance.get(),
                     log_fn=lambda m: self.after(0, self.log, m),
                     progress_fn=lambda p, s: self.after(0, self.update_progress, p, s),
                     stop_check_fn=lambda: self._stop_requested,
