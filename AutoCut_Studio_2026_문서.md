@@ -129,7 +129,8 @@ flowchart TD
   * **좌측 카드**: 날짜별 폴더 목록, 실시간 미디어 개수 배지, `🔄 개수 새로고침 (F5)`, 사진 포함 옵션
   * **중앙 카드**: 편집 모드(일반/하이라이트), 인트로 제목·로고 입력창(글자 겹침 없는 2열 다크 폼), 큼직한 `✔` (v-체크) 커스텀 체크박스 옵션
   * **우측 카드**: 출력 인코딩 사양(`HEVC`, 해상도, FPS, `bps`), 스타일 프리셋 및 유튜브 URL 학습기
-  * **하단 좌·우 분할**: 실시간 **CPU · GPU0(iGPU) · GPU1(NVIDIA, NVENC·VRAM) · NPU 사용률 그래프**([`SystemResourceMonitor`](file:///d:/workspace/autocut/autocut_gui.py) — 작업 관리자와 같은 Windows `GPU Engine` 성능 카운터, GPU 번호도 작업 관리자 순서)가 하단 전체 폭을 쓰고, **실시간 분석·편집 로그는 플로팅 창**(모니터 제목줄 오른쪽 체크박스로 표시/숨김, 창 ✕ = 체크 해제, 위치 저장 — v2.7.0)
+  * **하단 상태 줄**: 실시간 **CPU · GPU0(iGPU) · GPU1(NVIDIA, NVENC·VRAM) · NPU 사용률 숫자**([`SystemResourceMonitor`](file:///d:/workspace/autocut/autocut_gui.py) — 작업 관리자와 같은 Windows `GPU Engine` 성능 카운터, GPU 번호도 작업 관리자 순서)를 상태 줄 오른쪽에 표시하고, **사용률 그래프와 실시간 로그는 각각 플로팅 창**(체크박스로 표시/숨김, 창 ✕ = 체크 해제, 위치 저장 — 로그 v2.7.0, 그래프 v2.9.1). 비워진 공간은 위쪽 날짜 폴더 목록이 사용.
+  * **좌측 상단 날짜 (`display_date`, `resolve_display_date`, v2.9.1)**: 입력값(날짜 형식이면 `YYYY. MM. DD`로 정리) → 폴더 이름 날짜 → 폴더 안 가장 이른 촬영 날짜 순으로 정해 HUD와 인트로에 표시.
   * **최하단 타임라인 ([`TimelinePanel`](file:///d:/workspace/autocut/autocut_timeline.py))**: 선택한 날짜 폴더의 영상·사진을 썸네일 클립으로 배치. 드래그·`Ctrl+←/→`로 순서 변경, 우클릭으로 기기 시간 보정·회전, ⚠ 시각 이상 표시, HDR 배지. `Ctrl/Shift+클릭`·`Ctrl+A` 다중 선택 후 함께 이동·회전 (v2.6.0), 굵고 대비 높은 스크롤 바 + `보는 중 a–b / N` 위치 표시.
 * **프로그램 아이콘 (v2.6.0 · v2.8.1)**: 시네마 카메라 아이콘(`assets/autocut_icon.ico`, 16~256px 15가지 크기)이 창 제목줄·작업 표시줄·스플래시에 표시됩니다. 창 아이콘은 `WM_SETICON`으로 DPI에 맞는 정확한 크기(200%: 64/32px)를 넣어 선명하게 하고, 작업 표시줄 고정은 앱 ID `YumTaeng.AutoCutStudio.2026`을 가진 바로가기로 해야 카메라 아이콘으로 묶입니다.
 * **종료 시 인코딩 정리 (`enable_kill_children_on_exit`, `terminate_child_processes`, v2.7.1)**: 앱 프로세스를 KILL_ON_JOB_CLOSE 작업 개체에 넣어 강제 종료·오류 시에도 ffmpeg가 함께 종료되고(Ollama는 job 이탈), 편집 중 창을 닫으면 확인 후 즉시 중단 + `autocut_render_*` 임시 폴더 삭제(남은 폴더는 다음 실행 때 30분 이상 방치된 것만 정리). 최종 영상은 `*.partial.mp4` → 완료 시 이름 변경.

@@ -589,6 +589,9 @@ class AutoCutStudioApp(tk.Tk):
         self.intro_title = tk.StringVar(value="윰탱이네 제주도 여행")
         self.enable_hud = tk.BooleanVar(value=True)
         self.logo_text = tk.StringVar(value="윰탱해윤해진이네")
+        self.hud_date_text = tk.StringVar(value="")  # "" = folder-name date or earliest shooting date
+        self.show_hw_graph = tk.BooleanVar(value=False)
+        self._graph_geometry = ""
         self.enable_transitions = tk.BooleanVar(value=True)
         self.enable_bgm = tk.BooleanVar(value=True)
         self.custom_bgm_path = tk.StringVar(value="")
@@ -637,6 +640,7 @@ class AutoCutStudioApp(tk.Tk):
                 settings.pop("burn_subtitles", None)
             self._apply_settings(settings)
             self._log_geometry = str(session.get("log_window_geometry", "") or "")
+            self._graph_geometry = str(session.get("graph_window_geometry", "") or "")
         self.refresh_date_folders(manual=False)
         if session:
             self._restore_selection(session)
@@ -869,6 +873,7 @@ class AutoCutStudioApp(tk.Tk):
                 self._main_shown = True
                 self._apply_crisp_window_icon(self)
                 self.after(400, self._apply_log_window_visibility)  # restore the floating log if it was open
+                self.after(450, self._apply_graph_window_visibility)
                 self._tick_monitor()
 
         self.after(150, lambda: _animate_step(0))
@@ -925,6 +930,7 @@ class AutoCutStudioApp(tk.Tk):
             "include_scene_captions": self.include_scene_captions,
             "burn_subtitles": self.burn_subtitles,
             "show_log_window": self.show_log_window,
+            "show_hw_graph": self.show_hw_graph,
             "export_filmora_clean": self.export_filmora_clean,
             "include_photos": self.include_photos,
             "enable_intro": self.enable_intro,
@@ -932,6 +938,7 @@ class AutoCutStudioApp(tk.Tk):
             "intro_title": self.intro_title,
             "enable_hud": self.enable_hud,
             "logo_text": self.logo_text,
+            "hud_date_text": self.hud_date_text,
             "enable_transitions": self.enable_transitions,
             "enable_bgm": self.enable_bgm,
             "custom_bgm_path": self.custom_bgm_path,
@@ -957,6 +964,7 @@ class AutoCutStudioApp(tk.Tk):
             "selected_folders": [os.path.basename(self._date_folders[i]) for i in sel if i < len(self._date_folders)],
             "active_folder": os.path.basename(self.timeline.folder) if self.timeline.folder else "",
             "log_window_geometry": self.log_win.geometry() if self.log_win.winfo_viewable() else self._log_geometry,
+            "graph_window_geometry": self.graph_win.geometry() if self.graph_win.winfo_viewable() else self._graph_geometry,
         }
         if include_timelines:
             # Order / device time corrections / rotations of every date folder, so the file is self-contained
@@ -1283,7 +1291,7 @@ class AutoCutStudioApp(tk.Tk):
 
         # ── Center 3-Column Studio Grid ──────────────────────────────────────
         grid_area = ttk.Frame(main)
-        grid_area.pack(fill=tk.BOTH, expand=False, pady=(0, 12))
+        grid_area.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
         grid_area.columnconfigure(0, weight=10, uniform="col")
         grid_area.columnconfigure(1, weight=11, uniform="col")
         grid_area.columnconfigure(2, weight=11, uniform="col")
@@ -1413,6 +1421,15 @@ class AutoCutStudioApp(tk.Tk):
         )
         l_border, _ = self._make_dark_entry(form_brand, self.logo_text)
         l_border.grid(row=2, column=1, sticky="ew", pady=4)
+
+        ttk.Label(form_brand, text="좌측 상단 날짜", style="FormLabel.TLabel").grid(
+            row=3, column=0, sticky="w", padx=(0, 14), pady=4
+        )
+        date_row = ttk.Frame(form_brand, style="Card.TFrame")
+        date_row.grid(row=3, column=1, sticky="ew", pady=4)
+        d_border, _ = self._make_dark_entry(date_row, self.hud_date_text, width=16)
+        d_border.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(date_row, text=" 비우면 촬영 날짜 자동 · 예: 2025.09.20", style="Desc.TLabel").pack(side=tk.LEFT, padx=(6, 0))
 
         tk.Frame(col2, bg="#313244", height=1).pack(fill=tk.X, pady=(2, 6))
 
@@ -1578,28 +1595,20 @@ class AutoCutStudioApp(tk.Tk):
         self.yt_analyze_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         ttk.Button(yt_btns, text="샘플 파일 선택...", command=self.browse_reference_video).pack(side=tk.LEFT)
 
-        # ── Bottom Split Area: Monitor Graph (Left) + Real-time Log (Right) ──
-        # (packed last, after the timeline and footer, so it is the area that shrinks on small screens)
-        bot_split = ttk.Frame(main)
-        bot_split.columnconfigure(0, weight=1)
-        bot_split.rowconfigure(0, weight=1)
-
-        mon_card = tk.Frame(bot_split, bg=bg_card, highlightthickness=1, highlightbackground="#313244", padx=14, pady=10)
-        mon_card.grid(row=0, column=0, sticky="nsew")
-
-        # Title and per-device legend share one row so the graph keeps its height on small screens;
-        # the floating-log toggle sits at the right end of the same row
-        mon_header = ttk.Frame(mon_card, style="Card.TFrame")
-        mon_header.pack(fill=tk.X, pady=(0, 6))
-        self._make_vcheck(mon_header, "📋 실시간 분석·편집 로그 창 띄우기", self.show_log_window, bg=bg_card).pack(side=tk.RIGHT)
-        ttk.Label(mon_header, text="📊 하드웨어", style="SubHeader.TLabel").pack(side=tk.LEFT, padx=(0, 10))
-        self.mon_legend = tk.Frame(mon_header, bg=bg_card)
-        self.mon_legend.pack(side=tk.LEFT, fill=tk.X)
-        self._legend_labels = {}
-
+        # Usage graph: a floating window shown only while its checkbox is on (the live numbers sit in the footer)
+        self.graph_win = tk.Toplevel(self)
+        self.graph_win.withdraw()
+        self.graph_win.title("📈 하드웨어 사용률 그래프 — AutoCut Studio")
+        self.graph_win.configure(bg=bg_card)
+        self.graph_win.transient(self)
+        self.graph_win.protocol("WM_DELETE_WINDOW", lambda: self.show_hw_graph.set(False))
+        g_card = tk.Frame(self.graph_win, bg=bg_card, padx=12, pady=10)
+        g_card.pack(fill=tk.BOTH, expand=True)
+        self.graph_legend = tk.Label(g_card, text="", bg=bg_card, fg="#cdd6f4", font=(f_family, 9, "bold"), anchor="w")
+        self.graph_legend.pack(fill=tk.X, pady=(0, 6))
         self.graph_canvas = tk.Canvas(
-            mon_card,
-            height=90,
+            g_card,
+            height=160,
             bg="#14141f",
             highlightthickness=1,
             highlightbackground="#45475a",
@@ -1650,11 +1659,21 @@ class AutoCutStudioApp(tk.Tk):
         self.timeline.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
         self.include_photos.trace_add("write", lambda *_: self._sync_timeline(force=True))
         self.show_log_window.trace_add("write", lambda *_: self._apply_log_window_visibility())
-        bot_split.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self.show_hw_graph.trace_add("write", lambda *_: self._apply_graph_window_visibility())
 
         prog_row = ttk.Frame(footer)
         prog_row.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(prog_row, textvariable=self.status_var, style="Status.TLabel").pack(anchor="w", pady=(0, 4))
+        # Status line: progress text on the left; live hardware numbers + graph/log window toggles on the right
+        # (the footer is packed first, so this row is never squeezed away on smaller screens)
+        status_line = ttk.Frame(prog_row)
+        status_line.pack(fill=tk.X, pady=(0, 4))
+        self._make_vcheck(status_line, "📋 로그 창", self.show_log_window, bg=bg_main).pack(side=tk.RIGHT)
+        self._make_vcheck(status_line, "📈 사용률 그래프 창", self.show_hw_graph, bg=bg_main).pack(side=tk.RIGHT, padx=(0, 14))
+        self.mon_legend = tk.Frame(status_line, bg=bg_main)
+        self.mon_legend.pack(side=tk.RIGHT, padx=(0, 16))
+        self._legend_labels = {}
+        self._mon_bg = bg_main
+        ttk.Label(status_line, textvariable=self.status_var, style="Status.TLabel").pack(side=tk.LEFT)
         self.progress_bar = ttk.Progressbar(
             prog_row,
             variable=self.progress_var,
@@ -1748,12 +1767,14 @@ class AutoCutStudioApp(tk.Tk):
         for key, text, color, _ in self.monitor.series():
             lbl = self._legend_labels.get(key)
             if lbl is None:
-                lbl = tk.Label(self.mon_legend, bg="#242436", fg=color, font=("맑은 고딕", 9, "bold"), anchor="w")
+                lbl = tk.Label(self.mon_legend, bg=self._mon_bg, fg=color, font=("맑은 고딕", 9, "bold"), anchor="w")
                 lbl.pack(side=tk.LEFT, padx=(0, 10))
                 self._legend_labels[key] = lbl
             lbl.configure(text=text)
 
-        self._draw_resource_graph()
+        if self.graph_win.winfo_viewable():
+            self.graph_legend.configure(text="   ".join(t for _, t, _, _ in self.monitor.series()))
+            self._draw_resource_graph()
 
         # Auto-detect file additions/removals in folders every 2 seconds
         self._tick_count += 1
@@ -1831,6 +1852,30 @@ class AutoCutStudioApp(tk.Tk):
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+    def _apply_graph_window_visibility(self):
+        """Show / hide the floating hardware-usage graph to match its checkbox."""
+        if not getattr(self, "_main_shown", False):
+            return
+        win = self.graph_win
+        if self.show_hw_graph.get():
+            if not self._graph_geometry:
+                # First open: lower-left of the main window, ~40% x 28% of it
+                self.update_idletasks()
+                w, h = int(self.winfo_width() * 0.40), int(self.winfo_height() * 0.28)
+                x = self.winfo_rootx() + 40
+                y = self.winfo_rooty() + self.winfo_height() - h - 160
+                self._graph_geometry = f"{w}x{h}+{max(0, x)}+{max(0, y)}"
+            win.geometry(self._graph_geometry)
+            win.deiconify()
+            win.lift()
+            self._apply_crisp_window_icon(win)
+            self.after(50, self._draw_resource_graph)
+        else:
+            if win.winfo_viewable():
+                self._graph_geometry = win.geometry()
+            win.withdraw()
+        self._schedule_session_save()
 
     def _apply_log_window_visibility(self):
         """Show / hide the floating log window to match its checkbox (deferred until the main window is up)."""
@@ -2155,6 +2200,7 @@ class AutoCutStudioApp(tk.Tk):
                     intro_title=self.intro_title.get(),
                     intro_style=chosen_intro_style,
                     logo_text=self.logo_text.get(),
+                    display_date=self.hud_date_text.get(),
                     enable_hud=self.enable_hud.get(),
                     enable_transitions=self.enable_transitions.get(),
                     enable_bgm=self.enable_bgm.get(),

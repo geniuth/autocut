@@ -5,7 +5,7 @@
 
 - **Author GitHub**: [https://github.com/geniuth](https://github.com/geniuth)
 - **Repository**: [https://github.com/geniuth/autocut](https://github.com/geniuth/autocut)
-- **Current Version**: `v2.9.0` — 변경 이력은 [CHANGELOG.md](CHANGELOG.md) 참고 (Semantic Versioning)
+- **Current Version**: `v2.9.1` — 변경 이력은 [CHANGELOG.md](CHANGELOG.md) 참고 (Semantic Versioning)
 
 ---
 
@@ -189,7 +189,8 @@ DJI 드론(Mavic 3 / Air 3 / Mini 4 Pro 등)이나 Osmo Action / Osmo Pocket으�
 ### 실행 방법
 - **바탕화면 바로가기·작업 표시줄 아이콘 (v2.8.1)**: 바로가기는 `pythonw.exe "…utocut_gui.py"` + 아이콘 `assets/autocut_icon.ico` + 앱 ID(AppUserModelID) `YumTaeng.AutoCutStudio.2026`으로 만드세요. 앱 ID가 같아야 실행 중인 창이 고정한 바로가기에 묶여 카메라 아이콘으로 보입니다 (실행 중인 창을 바로 고정하면 `pythonw.exe`만 고정되어 파이썬 아이콘이 되고 클릭해도 AutoCut이 실행되지 않습니다). 아이콘은 16~256px 15가지 크기를 담고, 창 아이콘은 화면 배율에 맞는 정확한 크기로 설정해 200% 화면에서도 선명합니다.
 - **프로그램을 끄면 인코딩도 함께 종료** (v2.7.1): 편집 중에 창을 닫으면 확인 후 진행 중인 ffmpeg 인코딩을 즉시 멈추고 임시 작업 폴더를 지웁니다. 강제 종료·오류로 꺼져도 Windows 작업 개체(Job Object)가 ffmpeg를 함께 종료합니다 (Ollama 서버는 제외). 완성 파일은 `*.partial.mp4`로 쓰다가 끝나면 이름을 바꾸므로, 중간에 꺼져도 깨진 영상이 정상 이름으로 남지 않습니다.
-- **실시간 분석·편집 로그**는 하단 하드웨어 모니터 오른쪽의 `📋 실시간 분석·편집 로그 창 띄우기`를 체크하면 별도 창(플로팅)으로 뜨고, 끄거나 창의 ✕를 누르면 숨겨집니다 (숨겨져 있어도 로그는 계속 기록, 창 위치는 다음 실행 때 복원).
+- **하드웨어 사용률·로그 (v2.9.1)**: 맨 아래 상태 줄 오른쪽에 CPU·GPU0·GPU1(NVENC·VRAM)·NPU 사용률이 **숫자로** 항상 표시되고, `📈 사용률 그래프 창`을 체크하면 그래프가, `📋 로그 창`을 체크하면 실시간 분석·편집 로그가 별도 창(플로팅)으로 뜹니다. 끄거나 창의 ✕를 누르면 숨겨지고(로그는 숨겨져도 계속 기록), 창 위치는 다음 실행 때 복원됩니다.
+- **좌측 상단 날짜 (v2.9.1)**: `좌측 상단 날짜` 칸에 적은 날짜가 영상 왼쪽 위와 인트로 제목 아래에 표시됩니다 (`20250920`, `2025.9.20`, `2025년 9월 20일` → `2025. 09. 20`, 그 밖의 글자는 그대로). 비워 두면 폴더 이름이 날짜일 때는 그 날짜, 아니면 폴더 안 가장 이른 촬영 날짜를 씁니다 (예: `에버랜드` 폴더 → 2025. 09. 20).
 - 바탕화면 또는 폴더 내 **`AutoCut_Studio.vbs`** 더블클릭 (콘솔 창 없이 즉시 GUI 실행)
 - 또는 터미널에서 직접 실행:
   ```bash

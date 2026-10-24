@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "2.9.0"
+AUTOCUT_VERSION = "2.9.1"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -2387,11 +2387,34 @@ def find_best_shot_frame(
     return best_img_path
 
 
+_DATE_TEXT_RX = re.compile(r"^\s*(\d{4})\s*[-./년]?\s*(\d{1,2})\s*[-./월]?\s*(\d{1,2})\s*일?\s*$")
+
+
 def _format_date_korean_dot(date_name: str) -> str:
-    """Convert '2023-09-20' -> '2023. 09. 20'."""
-    if len(date_name) == 10 and date_name[4] == "-" and date_name[7] == "-":
-        return f"{date_name[:4]}. {date_name[5:7]}. {date_name[8:10]}"
+    """'2023-09-20' / '20230920' / '2023.9.20' / '2023년 9월 20일' -> '2023. 09. 20'; any other text is kept as typed."""
+    m = _DATE_TEXT_RX.match(date_name or "")
+    if m and 1 <= int(m.group(2)) <= 12 and 1 <= int(m.group(3)) <= 31:
+        return f"{m.group(1)}. {int(m.group(2)):02d}. {int(m.group(3)):02d}"
     return date_name
+
+
+def resolve_display_date(display_date: str, date_name: str, clips_meta: List[Dict]) -> Tuple[str, str]:
+    """
+    Date shown top-left in the video (HUD) and under the intro title: (text, where it came from).
+    Typed text wins; else the folder name if it is a date; else the earliest shooting date in the folder.
+    """
+    if (display_date or "").strip():
+        return display_date.strip(), "직접 입력"
+    if _DATE_TEXT_RX.match(date_name or ""):
+        return date_name, "폴더 이름"
+    days = sorted(
+        (c.get("creation_time") or "")[:10]
+        for c in clips_meta
+        if (c.get("creation_time") or "")[:4].isdigit() and (c.get("creation_time") or "")[:4] >= "2000"
+    )
+    if days:
+        return days[0], "촬영 날짜(메타데이터)"
+    return date_name, "폴더 이름"
 
 
 def create_hud_overlay_png(
@@ -3644,6 +3667,7 @@ def run_autocut_pipeline(
     max_edit_ratio: float = 0.6,
     output_dynamic_range: str = "sdr",
     auto_color_balance: bool = True,
+    display_date: str = "",
     log_fn: Callable[[str], None] = print,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     stop_check_fn: Optional[Callable[[], bool]] = None,
@@ -3656,6 +3680,7 @@ def run_autocut_pipeline(
     output_dynamic_range: "sdr" (Rec.709 8-bit, HDR clips tone-mapped) or "hlg" (BT.2020 10-bit HEVC HLG master:
         HLG clips kept, PQ converted, SDR clips/photos/intro placed at the 203-nit HDR reference white).
     auto_color_balance: per-clip HDR brightness/black/saturation balance picked with the CLIP aesthetic model.
+    display_date: date text for the top-left HUD and the intro ("" = folder-name date or earliest shooting date).
     Models:
       1) Faster-Whisper large-v3-turbo (Speech & VAD)
       2) CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5)
@@ -3990,11 +4015,15 @@ def run_autocut_pipeline(
         intro_dur = 3.0 if enable_intro else 0.0
         bgm_cursor = 0.0
 
+        shown_date, date_src = resolve_display_date(display_date, date_name, clips_meta)
+        log_fn(f"📅 영상 좌측 상단·인트로 날짜: {_format_date_korean_dot(shown_date)} ({date_src})")
+        analysis_summary["display_date"] = shown_date
+
         hud_png = os.path.join(tmpdir, "hud_overlay.png")
         if enable_hud:
             create_hud_overlay_png(
                 hud_png,
-                date_name=date_name,
+                date_name=shown_date,
                 logo_text=logo_text,
                 out_width=out_width,
                 out_height=out_height,
@@ -4048,7 +4077,7 @@ def run_autocut_pipeline(
                 best_img_path=best_img_path,
                 intro_mp4_path=intro_mp4,
                 title_text=intro_title,
-                date_name=date_name,
+                date_name=shown_date,
                 logo_text=logo_text,
                 duration=intro_dur,
                 bgm_path=bgm_file,

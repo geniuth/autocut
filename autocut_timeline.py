@@ -410,7 +410,7 @@ class TimelinePanel(tk.Frame):
         n_hlg = sum(1 for it in self.items if it.get("dynamic_range") == "HLG")
         n_pq = sum(1 for it in self.items if it.get("dynamic_range") == "HDR10")
         if n_hlg or n_pq:
-            parts.append(f"🌈 HDR {n_hlg + n_pq} (HLG {n_hlg}·PQ {n_pq})→SDR")
+            parts.append(f"🌈 HDR {n_hlg + n_pq} (HLG {n_hlg}·PQ {n_pq})")
         n_sus = sum(1 for it in self.items if it.get("suspect"))
         if n_sus:
             parts.append(f"⚠ 시간 이상 {n_sus} (우클릭→보정)")
