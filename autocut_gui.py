@@ -574,6 +574,12 @@ class AutoCutStudioApp(tk.Tk):
         self.whisper_model = tk.StringVar(value="large-v3-turbo")
         self.denoise_audio = tk.BooleanVar(value=True)
         self.auto_color_balance = tk.BooleanVar(value=True)
+        # Finishing tools (FilmCraft-inspired): match on by default, the slower / experimental ones opt-in
+        self.color_match = tk.BooleanVar(value=True)
+        self.loudness_match = tk.BooleanVar(value=True)
+        self.speaker_diarization = tk.BooleanVar(value=False)
+        self.stabilize = tk.BooleanVar(value=False)
+        self.vertical_reframe = tk.BooleanVar(value=False)
         self.include_scene_captions = tk.BooleanVar(value=True)
         # Burning subtitles re-encodes the whole finished video once more, so it is opt-in (SRTs are always written)
         self.burn_subtitles = tk.BooleanVar(value=False)
@@ -927,6 +933,11 @@ class AutoCutStudioApp(tk.Tk):
             "whisper_model": self.whisper_model,
             "denoise_audio": self.denoise_audio,
             "auto_color_balance": self.auto_color_balance,
+            "color_match": self.color_match,
+            "loudness_match": self.loudness_match,
+            "speaker_diarization": self.speaker_diarization,
+            "stabilize": self.stabilize,
+            "vertical_reframe": self.vertical_reframe,
             "include_scene_captions": self.include_scene_captions,
             "burn_subtitles": self.burn_subtitles,
             "show_log_window": self.show_log_window,
@@ -1551,7 +1562,25 @@ class AutoCutStudioApp(tk.Tk):
             font=(f_family, 10),
         ).grid(row=6, column=1, sticky="ew", pady=4)
 
-        tk.Frame(col3, bg="#313244", height=1).pack(fill=tk.X, pady=(4, 8))
+        tk.Frame(col3, bg="#313244", height=1).pack(fill=tk.X, pady=(2, 4))
+
+        # Finishing tools in a compact 3x2 grid (the timeline below needs the height); details are in the docs:
+        # color match = clips shot within 15 min unified, loudness = one fixed gain per clip, stabilization =
+        # phones only, vertical = 9:16 face-tracking copy, speakers = experimental, ~400 MB model on first use
+        finish = ttk.Frame(col3, style="Card.TFrame")
+        finish.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(finish, text="✨ 마무리 보정", style="SubHeader.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        for i, (lbl_txt, var_obj) in enumerate(
+            (
+                ("기기 간 색 맞춤", self.color_match),
+                ("클립 음량 맞춤", self.loudness_match),
+                ("손떨림 보정(폰)", self.stabilize),
+                ("세로 쇼츠 9:16", self.vertical_reframe),
+                ("화자 구분(실험적)", self.speaker_diarization),
+            ),
+            start=1,
+        ):
+            self._make_vcheck(finish, lbl_txt, var_obj, bg=bg_card).grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 10), pady=0)
 
         ttk.Label(col3, text="🎨 편집 스타일 프리셋 & 유튜브 학습", style="SubHeader.TLabel").pack(
             anchor="w", pady=(0, 5)
@@ -1566,7 +1595,7 @@ class AutoCutStudioApp(tk.Tk):
         self.preset_combo.pack(fill=tk.X, pady=(0, 5))
         self.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_changed)
 
-        tk.Label(
+        style_desc_lbl = tk.Label(
             col3,
             textvariable=self.style_desc_var,
             bg="#1e1e2e",
@@ -1577,7 +1606,10 @@ class AutoCutStudioApp(tk.Tk):
             wraplength=460,
             padx=10,
             pady=5,
-        ).pack(fill=tk.X, pady=(0, 8))
+        )
+        style_desc_lbl.pack(fill=tk.X, pady=(0, 8))
+        # wrap at the column's real width (a fixed 460 px wraps early on high-DPI screens and costs a line)
+        style_desc_lbl.bind("<Configure>", lambda e: e.widget.configure(wraplength=max(200, e.width - 24)))
 
         ttk.Label(col3, text="유튜브 레퍼런스 URL 또는 영상 경로", style="FormLabel.TLabel").pack(
             anchor="w", pady=(0, 4)
@@ -1754,7 +1786,7 @@ class AutoCutStudioApp(tk.Tk):
                 self.after(0, _apply_ui)
             except Exception as e:
                 self.after(0, self.log, f"❌ 유튜브 스타일 분석 오류: {e}")
-                self.after(0, lambda: messagebox.showerror("스타일 분석 실패", f"유튜브/영상 스타일 분석 중 오류가 발생했습니다:\n{e}"))
+                self.after(0, lambda err=e: messagebox.showerror("스타일 분석 실패", f"유튜브/영상 스타일 분석 중 오류가 발생했습니다:\n{err}"))
             finally:
                 self.after(0, lambda: self.yt_analyze_btn.configure(state=tk.NORMAL))
 
@@ -2217,6 +2249,11 @@ class AutoCutStudioApp(tk.Tk):
                     max_edit_ratio=_parse_edit_ratio(self.max_edit_ratio_var.get()),
                     output_dynamic_range=DYNAMIC_RANGE_CHOICES.get(self.dynamic_range_var.get(), "sdr"),
                     auto_color_balance=self.auto_color_balance.get(),
+                    color_match=self.color_match.get(),
+                    loudness_match=self.loudness_match.get(),
+                    speaker_diarization=self.speaker_diarization.get(),
+                    stabilize=self.stabilize.get(),
+                    vertical_reframe=self.vertical_reframe.get(),
                     log_fn=lambda m: self.after(0, self.log, m),
                     progress_fn=lambda p, s: self.after(0, self.update_progress, p, s),
                     stop_check_fn=lambda: self._stop_requested,
@@ -2242,7 +2279,7 @@ class AutoCutStudioApp(tk.Tk):
             )
         except Exception as e:
             self.after(0, self.log, f"❌ 작업 중단/오류: {e}")
-            self.after(0, lambda: self.status_var.set(f"오류/중단: {e}"))
+            self.after(0, lambda err=e: self.status_var.set(f"오류/중단: {err}"))
         finally:
             self._running = False
             self.after(0, lambda: self.start_btn.configure(state=tk.NORMAL))

@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "2.9.1"
+AUTOCUT_VERSION = "3.0.0"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -1587,6 +1587,899 @@ def ensure_auto_color(
     return result
 
 
+# ==============================================================================
+# Finishing tools (ideas from FilmCraft, re-implemented on ffmpeg + numpy):
+# clip loudness match, color match, speaker diarization, stabilization, vertical auto reframe
+# ==============================================================================
+
+
+def _file_cache_key(path: str) -> str:
+    st = os.stat(path)
+    return f"{os.path.basename(path)}|{st.st_size}|{int(st.st_mtime)}"
+
+
+def _load_json_cache(path: str) -> Dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_json_cache(path: str, data: Dict) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def _ff_filter_path(path: str) -> str:
+    """A file path as a quoted filtergraph option value (Windows drive colon escaped)."""
+    return "'" + path.replace("\\", "/").replace(":", "\\:") + "'"
+
+
+def _video_clips_in_edit(clips_meta: List[Dict]) -> List[Dict]:
+    return [
+        c
+        for c in clips_meta
+        if c.get("type", "video") == "video" and c.get("kept_intervals") and os.path.exists(c.get("path", ""))
+    ]
+
+
+# ── Clip loudness match ──────────────────────────────────────────────────────
+# One fixed gain per source file (from its BS.1770 integrated loudness) instead of loudnorm on every cut:
+# loudnorm re-levels each few-second cut on its own, so the same scene pumps from cut to cut and a quiet
+# moment gets pushed up to the same level as a shout. A static gain keeps the scene's natural dynamics.
+
+LOUDNESS_VERSION = 1
+LOUDNESS_TARGET_LUFS = -16.0
+_LOUD_MAX_BOOST_DB = 10.0
+_LOUD_MAX_CUT_DB = -12.0
+
+
+def measure_integrated_loudness(path: str) -> Optional[float]:
+    """Integrated loudness (LUFS, EBU R128 / BS.1770) of a file's audio after the render's rumble/noise cleanup."""
+    res = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-nostats", "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn",
+            "-af", "highpass=f=85,afftdn=nf=-25,ebur128=framelog=quiet", "-f", "null", "-",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    found = re.findall(r"I:\s+(-?[\d.]+|-inf) LUFS", res.stderr.decode("utf-8", "ignore"))
+    try:
+        val = float(found[-1])
+    except (IndexError, ValueError):
+        return None
+    return val if np.isfinite(val) else None
+
+
+def loudness_gain_db(lufs: Optional[float]) -> float:
+    """Static gain that brings a clip to the target; near-silent clips are left alone instead of boosting noise."""
+    if lufs is None or lufs < -60.0:
+        return 0.0
+    return float(np.clip(LOUDNESS_TARGET_LUFS - lufs, _LOUD_MAX_CUT_DB, _LOUD_MAX_BOOST_DB))
+
+
+def clip_audio_chain(gain_db: Optional[float]) -> str:
+    """Cleanup + level for a video cut's own sound. None = legacy per-cut loudnorm."""
+    if gain_db is None:
+        return "highpass=f=85,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000"
+    # alimiter at -1.5 dBTP catches the peaks the static gain pushes over; latency=1 keeps lip sync
+    return (
+        f"highpass=f=85,afftdn=nf=-25,volume={gain_db:.2f}dB,"
+        "alimiter=limit=0.84:level=0:latency=1:release=80,aresample=48000"
+    )
+
+
+def ensure_loudness(
+    clips_meta: List[Dict],
+    cache_path: str,
+    log_fn: Callable[[str], None] = print,
+    progress_fn: Optional[Callable[[float, str], None]] = None,
+) -> Dict[str, float]:
+    """{path: gain dB} for every video clip with sound in the edit; loudness measured once per file and cached."""
+    cache = _load_json_cache(cache_path)
+    gains: Dict[str, float] = {}
+    todo = []
+    for c in _video_clips_in_edit(clips_meta):
+        p = c["path"]
+        if not _has_audio_stream(p):
+            continue
+        key = _file_cache_key(p)
+        hit = cache.get(key)
+        if hit and hit.get("v") == LOUDNESS_VERSION:
+            gains[p] = loudness_gain_db(hit.get("lufs"))
+        else:
+            todo.append((p, key))
+    if todo:
+        log_fn(f"🔊 클립 음량 측정: {len(todo)}개 파일 (BS.1770 통합 음량 · 결과는 캐시)")
+        for i, (p, key) in enumerate(todo, 1):
+            if progress_fn:
+                progress_fn(46.0, f"클립 음량 측정 중 ({i}/{len(todo)}): {os.path.basename(p)}")
+            lufs = measure_integrated_loudness(p)
+            cache[key] = {"v": LOUDNESS_VERSION, "lufs": None if lufs is None else round(lufs, 2)}
+            gains[p] = loudness_gain_db(lufs)
+        _save_json_cache(cache_path, cache)
+    if gains:
+        g = np.array(list(gains.values()))
+        log_fn(
+            f"🔊 클립 음량 자동 맞춤: {len(gains)}개 클립을 {LOUDNESS_TARGET_LUFS:.0f} LUFS 기준 고정 게인으로 "
+            f"(게인 {g.min():+.1f} ~ {g.max():+.1f} dB, 컷마다 다시 맞추지 않아 장면 안의 강약 유지)"
+        )
+    return gains
+
+
+# ── Color match ──────────────────────────────────────────────────────────────
+# Every clip is measured in Oklab on what the viewer sees (the SDR view, after HDR tone mapping and the auto
+# color balance), split into shadows / midtones / highlights. A clip's reference look is the duration-weighted
+# median of the clips shot within 15 minutes of it (typically the other cameras at the same moment), so
+# devices are unified while different scenes keep their own light; each clip moves part of the way toward
+# it (tint per tonal range + overall chroma).
+# Skin pixels barely count when measuring and the shift is scaled back if skin hue would turn > 8 degrees.
+# The correction is baked into a per-clip 3D LUT (lut3d), so measurement and render use the exact same math.
+
+COLOR_MATCH_VERSION = 1
+_CM_STRENGTH = 0.7
+_CM_MAX_SHIFT = 0.02  # Oklab a/b units: about a clearly visible warm/cool cast
+_CM_WINDOW_SEC = 15 * 60  # clips shot within this time of each other count as the same moment
+_CM_SKIN_MAX_HUE_DEG = 8.0
+_CM_LUT_SIZE = 33
+
+_M_LIN709_TO_LMS = np.array(
+    [[0.4122214708, 0.5363325363, 0.0514459929], [0.2119034982, 0.6806995451, 0.1073969566], [0.0883024619, 0.2817188376, 0.6299787005]]
+)
+_M_LMS_TO_OKLAB = np.array(
+    [[0.2104542553, 0.7936177850, -0.0040720468], [1.9779984951, -2.4285922050, 0.4505937099], [0.0259040371, 0.7827717662, -0.8086757660]]
+)
+_M_LMS_TO_LIN709 = np.linalg.inv(_M_LIN709_TO_LMS)
+_M_OKLAB_TO_LMS = np.linalg.inv(_M_LMS_TO_OKLAB)
+_M_2020_TO_709 = np.array([[1.6605, -0.5876, -0.0728], [-0.1246, 1.1329, -0.0083], [-0.0182, -0.1006, 1.1187]])
+_M_709_TO_2020 = np.linalg.inv(_M_2020_TO_709)
+
+
+def _srgb_eotf(v: np.ndarray) -> np.ndarray:
+    a = np.abs(v)
+    return np.sign(v) * np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4)
+
+
+def _srgb_oetf(v: np.ndarray) -> np.ndarray:
+    a = np.abs(v)
+    return np.sign(v) * np.where(a <= 0.0031308, a * 12.92, 1.055 * a ** (1 / 2.4) - 0.055)
+
+
+def _lin709_to_oklab(rgb: np.ndarray) -> np.ndarray:
+    return np.cbrt(rgb @ _M_LIN709_TO_LMS.T) @ _M_LMS_TO_OKLAB.T
+
+
+def _oklab_to_lin709(lab: np.ndarray) -> np.ndarray:
+    return ((lab @ _M_OKLAB_TO_LMS.T) ** 3) @ _M_LMS_TO_LIN709.T
+
+
+def _smoothstep(e0: float, e1: float, x: np.ndarray) -> np.ndarray:
+    t = np.clip((x - e0) / (e1 - e0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _cm_range_weights(L: np.ndarray) -> np.ndarray:
+    """(..., 3) shadows / midtones / highlights membership of each Oklab lightness."""
+    ws = _smoothstep(0.55, 0.15, L)
+    wh = _smoothstep(0.45, 0.85, L)
+    return np.stack([ws, np.clip(1.0 - ws - wh, 0.0, 1.0), wh], axis=-1)
+
+
+def _cm_skin_mask(lab: np.ndarray) -> np.ndarray:
+    C = np.hypot(lab[..., 1], lab[..., 2])
+    h = np.degrees(np.arctan2(lab[..., 2], lab[..., 1])) % 360.0
+    L = lab[..., 0]
+    return (h >= 20) & (h <= 75) & (C >= 0.02) & (C <= 0.2) & (L >= 0.25) & (L <= 0.92)
+
+
+def _cm_apply_lab(lab: np.ndarray, corr: Dict) -> np.ndarray:
+    """Scale chroma, then tint each tonal range (pure black and white stay neutral)."""
+    L = lab[..., 0]
+    w = _cm_range_weights(L)
+    fade = _smoothstep(0.0, 0.12, L) * (1.0 - _smoothstep(0.95, 1.0, L))
+    out = lab.copy()
+    out[..., 1] = lab[..., 1] * corr["k"] + (w @ np.asarray(corr["da"])) * fade
+    out[..., 2] = lab[..., 2] * corr["k"] + (w @ np.asarray(corr["db"])) * fade
+    return out
+
+
+def _cm_measure(frames_rgb: np.ndarray) -> Dict:
+    """Oklab look of a clip from (n, H, W, 3) uint8 display-referred frames."""
+    small = np.stack([cv2.resize(f, (96, 54), interpolation=cv2.INTER_AREA) for f in frames_rgb])
+    lab = _lin709_to_oklab(_srgb_eotf(small.reshape(-1, 3).astype(np.float64) / 255.0))
+    skin = _cm_skin_mask(lab)
+    w = _cm_range_weights(lab[:, 0]) * np.where(skin, 0.2, 1.0)[:, None]
+    wsum = w.sum(axis=0)
+    a = (w * lab[:, 1:2]).sum(axis=0) / np.maximum(wsum, 1e-9)
+    b = (w * lab[:, 2:3]).sum(axis=0) / np.maximum(wsum, 1e-9)
+    lit = lab[:, 0] > 0.1
+    chroma = float(np.hypot(lab[lit, 1], lab[lit, 2]).mean()) if lit.any() else 0.0
+    skin_px = lab[skin]
+    if len(skin_px) > 240:
+        skin_px = skin_px[np.linspace(0, len(skin_px) - 1, 240).astype(int)]
+    return {
+        "v": COLOR_MATCH_VERSION,
+        "a": [round(float(x), 5) for x in a],
+        "b": [round(float(x), 5) for x in b],
+        "share": [round(float(x), 4) for x in wsum / len(lab)],
+        "chroma": round(chroma, 5),
+        "skin": np.round(skin_px, 4).tolist(),
+    }
+
+
+def _weighted_median(values: List[float], weights: List[float]) -> float:
+    order = np.argsort(values)
+    v = np.asarray(values, dtype=float)[order]
+    w = np.asarray(weights, dtype=float)[order]
+    cw = np.cumsum(w)
+    return float(v[np.searchsorted(cw, cw[-1] / 2.0)])
+
+
+def _cm_reference(stats: List[Tuple[Dict, float]]) -> Dict:
+    ref: Dict = {"a": [None] * 3, "b": [None] * 3}
+    for r in range(3):
+        use = [(s, w) for s, w in stats if s["share"][r] >= 0.03]
+        if use:
+            ref["a"][r] = _weighted_median([s["a"][r] for s, _ in use], [w for _, w in use])
+            ref["b"][r] = _weighted_median([s["b"][r] for s, _ in use], [w for _, w in use])
+    ref["chroma"] = _weighted_median([s["chroma"] for s, _ in stats], [w for _, w in stats])
+    return ref
+
+
+def _cm_hue_shift_deg(skin: np.ndarray, corr: Dict) -> float:
+    after = _cm_apply_lab(skin, corr)
+    h0 = np.arctan2(skin[:, 2], skin[:, 1])
+    h1 = np.arctan2(after[:, 2], after[:, 1])
+    return float(np.degrees(np.abs(np.angle(np.exp(1j * (h1 - h0))))).mean())
+
+
+def _cm_solve(st: Dict, ref: Dict, strength: float = _CM_STRENGTH) -> Dict:
+    da, db = [], []
+    for r in range(3):
+        if st["share"][r] < 0.03 or ref["a"][r] is None:
+            da.append(0.0)
+            db.append(0.0)
+            continue
+        da.append(float(np.clip(strength * (ref["a"][r] - st["a"][r]), -_CM_MAX_SHIFT, _CM_MAX_SHIFT)))
+        db.append(float(np.clip(strength * (ref["b"][r] - st["b"][r]), -_CM_MAX_SHIFT, _CM_MAX_SHIFT)))
+    k = float(np.clip((ref["chroma"] / max(st["chroma"], 1e-3)) ** strength, 0.85, 1.2)) if st["chroma"] > 0.005 else 1.0
+    corr = {"da": da, "db": db, "k": k, "skin_scale": 1.0}
+    skin = np.asarray(st.get("skin") or [], dtype=float).reshape(-1, 3)
+    if len(skin) >= 20 and _cm_hue_shift_deg(skin, corr) > _CM_SKIN_MAX_HUE_DEG:
+        lo, hi = 0.0, 1.0
+        for _ in range(14):
+            mid = (lo + hi) / 2.0
+            trial = {"da": [x * mid for x in da], "db": [x * mid for x in db], "k": 1.0 + (k - 1.0) * mid}
+            if _cm_hue_shift_deg(skin, trial) > _CM_SKIN_MAX_HUE_DEG:
+                hi = mid
+            else:
+                lo = mid
+        corr = {"da": [x * lo for x in da], "db": [x * lo for x in db], "k": 1.0 + (k - 1.0) * lo, "skin_scale": round(lo, 3)}
+    return corr
+
+
+def _cm_distance(st: Dict, ref: Dict, corr: Optional[Dict] = None) -> float:
+    """Average tint distance to the reference over the tonal ranges a clip has (x100 Oklab units)."""
+    d = []
+    for r in range(3):
+        if st["share"][r] < 0.03 or ref["a"][r] is None:
+            continue
+        a, b = st["a"][r], st["b"][r]
+        if corr:
+            a, b = a * corr["k"] + corr["da"][r], b * corr["k"] + corr["db"][r]
+        d.append(np.hypot(a - ref["a"][r], b - ref["b"][r]))
+    return float(np.mean(d) * 100.0) if d else 0.0
+
+
+def write_color_match_lut(path: str, corr: Dict, domain: str = "sdr") -> None:
+    """
+    Bake a correction into a .cube 3D LUT for lut3d.
+    domain "sdr": Rec.709 signal. domain "hlg": BT.2020 HLG signal of an HLG master, mapped onto the SDR view
+    (HLG reference white = 75% signal) so the correction measured there carries over.
+    The LUT is identity + (correction - roundtrip), so an all-zero correction is an exact no-op.
+    """
+    n = _CM_LUT_SIZE
+    g = np.linspace(0.0, 1.0, n)
+    bb, gg, rr = np.meshgrid(g, g, g, indexing="ij")  # .cube order: red changes fastest
+    rgb = np.stack([rr, gg, bb], axis=-1).reshape(-1, 3)
+
+    def through(c: Dict) -> np.ndarray:
+        if domain == "hlg":
+            lin = _srgb_eotf(rgb / 0.75) @ _M_2020_TO_709.T
+            lin2 = _oklab_to_lin709(_cm_apply_lab(_lin709_to_oklab(lin), c))
+            return _srgb_oetf(lin2 @ _M_709_TO_2020.T) * 0.75
+        return _srgb_oetf(_oklab_to_lin709(_cm_apply_lab(_lin709_to_oklab(_srgb_eotf(rgb)), c)))
+
+    ident = {"da": [0.0] * 3, "db": [0.0] * 3, "k": 1.0}
+    out = np.clip(rgb + (through(corr) - through(ident)), 0.0, 1.0)
+    with open(path, "w", encoding="ascii") as f:
+        f.write(f'TITLE "AutoCut color match"\nLUT_3D_SIZE {n}\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 1 1 1\n')
+        np.savetxt(f, out, fmt="%.6f")
+
+
+def _cm_sample_view(path: str, duration: float, dr: Dict[str, str], adjust: Optional[Dict], pre_vf: str, workdir: str) -> Optional[np.ndarray]:
+    """(n, 180, 320, 3) RGB keyframes of a clip as displayed in an SDR edit (HDR tone-mapped + auto color)."""
+    if dr.get("range", "SDR") == "SDR":
+        step = max(0.5, float(duration or 0) / 7)
+        vf = f"select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,{step:.2f})',"
+        if pre_vf:
+            vf += pre_vf.strip(",") + ","
+        vf += f"scale={_AC_W}:{_AC_H},format=rgb24"
+        raw = subprocess.run(
+            ["ffmpeg", "-v", "error", "-discard", "nokey", "-i", path, "-vf", vf, "-fps_mode", "passthrough",
+             "-frames:v", "6", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            capture_output=True,
+        ).stdout
+        if not raw:
+            return None
+        return np.frombuffer(raw, np.uint8).reshape(-1, _AC_H, _AC_W, 3)
+    if _hdr_tonemap_backend() != "libplacebo":
+        return None
+    tiny = os.path.join(workdir, f"cm_{abs(hash(path)) % 10**8}.mkv")
+    if not _ac_sample_frames(path, duration, tiny):
+        return None
+    try:
+        outs = _ac_render(tiny, dr.get("trc", "arib-std-b67"), [adjust or {}])
+        return outs[0] if outs else None
+    finally:
+        try:
+            os.remove(tiny)
+        except OSError:
+            pass
+
+
+def ensure_color_match(
+    clips_meta: List[Dict],
+    auto_color_map: Dict[str, Dict],
+    color_filters: Dict[str, str],
+    output_dr: str,
+    cache_path: str,
+    workdir: str,
+    log_fn: Callable[[str], None] = print,
+    progress_fn: Optional[Callable[[float, str], None]] = None,
+) -> Dict[str, str]:
+    """
+    Match every video clip toward the look of the clips shot around the same time. Returns {path: lut3d filter}
+    (clips that need no change are omitted).
+    color_filters: per-clip color-profile filters (D-Log restore) that run before the match.
+    """
+    cache = _load_json_cache(cache_path)
+    measured: List[Tuple[Dict, Dict, float]] = []
+    todo = []
+    for c in _video_clips_in_edit(clips_meta):
+        p = c["path"]
+        dr = detect_dynamic_range(p)
+        adj = auto_color_map.get(p)
+        adj_sig = ",".join(f"{adj.get(k, 0):.3f}" for k in ("brightness", "contrast", "saturation", "gamma")) if adj else ""
+        cf = color_filters.get(p, "")
+        key = f"{_file_cache_key(p)}|{adj_sig}|{cf}"
+        kept = sum(e - s for s, e in c["kept_intervals"])
+        hit = cache.get(key)
+        if hit and hit.get("v") == COLOR_MATCH_VERSION:
+            measured.append((c, hit, kept))
+        else:
+            todo.append((c, p, dr, adj, cf, key, kept))
+    if todo:
+        log_fn(f"🎨 컬러 매치 측정: {len(todo)}개 클립 (Oklab 어두운·중간·밝은 영역별 색, 결과는 캐시)")
+        for i, (c, p, dr, adj, cf, key, kept) in enumerate(todo, 1):
+            if progress_fn:
+                progress_fn(46.5, f"컬러 매치 측정 중 ({i}/{len(todo)}): {os.path.basename(p)}")
+            frames = _cm_sample_view(p, float(c.get("duration", 0.0) or 0.0), dr, adj, "" if dr["range"] != "SDR" else cf, workdir)
+            if frames is None or not len(frames):
+                continue
+            st = _cm_measure(frames)
+            cache[key] = st
+            measured.append((c, st, kept))
+        _save_json_cache(cache_path, cache)
+    if len(measured) < 2:
+        return {}
+
+    times = [_clip_time_sec(c, 0.0) for c, _, _ in measured]
+    result: Dict[str, str] = {}
+    before, after, skin_limited, alone = [], [], 0, 0
+    for idx, (c, st, kept) in enumerate(measured):
+        # reference = the clips shot around the same time (other cameras at the same moment), not the whole
+        # trip: a warm indoor evening and a blue seaside noon are meant to look different
+        near = [
+            (st2, max(0.5, kept2))
+            for (c2, st2, kept2), t2 in zip(measured, times)
+            if times[idx] is not None and t2 is not None and abs(t2 - times[idx]) <= _CM_WINDOW_SEC
+        ]
+        if len(near) < 2:
+            alone += 1
+            continue
+        ref = _cm_reference(near)
+        corr = _cm_solve(st, ref)
+        d0, d1 = _cm_distance(st, ref), _cm_distance(st, ref, corr)
+        before.append(d0)
+        after.append(d1)
+        if corr["skin_scale"] < 0.999:
+            skin_limited += 1
+        if max(abs(x) for x in corr["da"] + corr["db"]) < 0.003 and abs(corr["k"] - 1.0) < 0.02:
+            continue
+        p = c["path"]
+        domain = "hlg" if (output_dr == "hlg" and detect_dynamic_range(p)["range"] != "SDR") else "sdr"
+        lut = os.path.join(workdir, f"colormatch_{idx:04d}.cube")
+        write_color_match_lut(lut, corr, domain)
+        result[p] = f"lut3d=file={_ff_filter_path(lut)}"
+    log_fn(
+        f"🎨 컬러 매치(같은 시간대 ±{_CM_WINDOW_SEC // 60}분 클립끼리): {len(measured)}개 클립 중 {len(result)}개 보정"
+        + (f" · 주변 클립과의 색차 평균 {np.mean(before):.2f} → {np.mean(after):.2f}" if before else "")
+        + f" (강도 {int(_CM_STRENGTH * 100)}%"
+        + (f", 피부톤 보호로 {skin_limited}개 약하게" if skin_limited else "")
+        + (f", 혼자 찍힌 {alone}개는 그대로" if alone else "")
+        + ")"
+    )
+    return result
+
+
+# ── Speaker diarization (experimental) ───────────────────────────────────────
+# Each Whisper sentence gets a speaker embedding (x-vector) from WavLM-Base-Plus-SV, a speaker-verification
+# model (MIT, ~400 MB, downloaded on first use); the vectors of the whole folder are clustered with average
+# linkage on cosine distance. (Plain MFCC voice vectors, as FilmCraft uses for single recordings, group by
+# room and microphone across many clips instead of by voice.) Overlapping family chatter and small children
+# remain hard, so the labels are a starting point for the editor, not ground truth.
+
+DIARIZE_VERSION = 2
+SPEAKER_MODEL_ID = "microsoft/wavlm-base-plus-sv"
+_DZ_SR = 16000
+_DZ_THRESHOLD = 0.42  # average cosine distance below which sentences are merged into one voice
+_DZ_MAX_SPEAKERS = 6
+_DZ_MIN_SEG_SEC = 0.6
+_DZ_MAX_SEG_SEC = 8.0
+SPEAKER_ASS_COLORS = ["&HFFFFFF&", "&H6EE6FF&", "&HFFDC78&", "&HC896FF&", "&H96F096&", "&H5AB4FF&"]
+
+
+def _dz_read_audio(path: str) -> np.ndarray:
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", str(_DZ_SR),
+         "-af", "highpass=f=85", "-f", "f32le", "-"],
+        capture_output=True,
+    ).stdout
+    return np.frombuffer(raw, np.float32)
+
+
+class _SpeakerEncoder:
+    def __init__(self):
+        import torch
+        from transformers import AutoFeatureExtractor, WavLMForXVector
+
+        self.torch = torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.fe = AutoFeatureExtractor.from_pretrained(SPEAKER_MODEL_ID)
+        self.model = WavLMForXVector.from_pretrained(SPEAKER_MODEL_ID).to(self.device).eval()
+
+    def embed(self, audio: np.ndarray) -> np.ndarray:
+        inp = self.fe(audio, sampling_rate=_DZ_SR, return_tensors="pt").to(self.device)
+        with self.torch.no_grad():
+            e = self.model(**inp).embeddings[0].float().cpu().numpy()
+        return e / max(float(np.linalg.norm(e)), 1e-9)
+
+
+def _dz_clip_segments(enc: "_SpeakerEncoder", path: str, speech: List[Dict]) -> List[List]:
+    """[[start, end, base64 float16 embedding], ...] for the sentences long enough to judge."""
+    import base64
+
+    audio = _dz_read_audio(path)
+    out = []
+    for sp in speech:
+        seg = audio[int(sp["start"] * _DZ_SR) : int(sp["end"] * _DZ_SR)]
+        if len(seg) < _DZ_MIN_SEG_SEC * _DZ_SR:
+            continue
+        if len(seg) > _DZ_MAX_SEG_SEC * _DZ_SR:  # long Whisper spans: the middle 8 s
+            mid, half = len(seg) // 2, int(_DZ_MAX_SEG_SEC * _DZ_SR / 2)
+            seg = seg[mid - half : mid + half]
+        emb = enc.embed(seg)
+        out.append([sp["start"], sp["end"], base64.b64encode(emb.astype(np.float16).tobytes()).decode("ascii")])
+    return out
+
+
+def diarize_speakers(
+    clips_meta: List[Dict],
+    cache_path: str,
+    log_fn: Callable[[str], None] = print,
+    progress_fn: Optional[Callable[[float, str], None]] = None,
+) -> int:
+    """
+    Label every Whisper sentence with a speaker (sp["speaker"] = 1.. by amount of speech, in place).
+    Returns the number of speakers found (0 = nothing to label).
+    """
+    import base64
+
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial.distance import pdist, squareform
+
+    cache = _load_json_cache(cache_path)
+    entries: List[Tuple[Dict, List]] = []
+    todo = []
+    for c in _video_clips_in_edit(clips_meta):
+        if not c.get("speech"):
+            continue
+        key = _file_cache_key(c["path"])
+        hit = cache.get(key)
+        if hit and hit.get("v") == DIARIZE_VERSION:
+            entries.append((c, hit["segs"]))
+        else:
+            todo.append((c, key))
+    if todo:
+        log_fn(f"🗣️ 화자 구분 분석: {len(todo)}개 클립 (WavLM 화자 임베딩 · 결과는 캐시)")
+        try:
+            enc = _SpeakerEncoder()
+        except Exception as ex:
+            log_fn(f"⚠️ 화자 구분 모델({SPEAKER_MODEL_ID})을 불러오지 못해 건너뜁니다: {ex}")
+            return 0
+        try:
+            for i, (c, key) in enumerate(todo, 1):
+                if progress_fn:
+                    progress_fn(46.0, f"화자 구분 분석 중 ({i}/{len(todo)}): {c.get('file', '')}")
+                segs = _dz_clip_segments(enc, c["path"], c.get("speech", []))
+                cache[key] = {"v": DIARIZE_VERSION, "segs": segs}
+                entries.append((c, segs))
+        finally:
+            del enc
+            _release_cuda_vram()
+        _save_json_cache(cache_path, cache)
+
+    vecs, refs = [], []
+    for c, segs in entries:
+        for s, e, b64 in segs:
+            vecs.append(np.frombuffer(base64.b64decode(b64), np.float16).astype(np.float64))
+            refs.append((c, s, e))
+    if not vecs:
+        return 0
+    if len(vecs) > 4000:  # keep the O(n^2) clustering bounded: longest sentences first
+        keep = np.sort(np.argsort([e - s for _, s, e in refs])[-4000:])
+        vecs, refs = [vecs[i] for i in keep], [refs[i] for i in keep]
+    V = np.stack(vecs)
+    W = np.asarray([min(e - s, _DZ_MAX_SEG_SEC) for _, s, e in refs])
+    if len(V) == 1:
+        labels = np.array([1])
+    else:
+        D = pdist(V, "cosine")
+        Z = linkage(D, method="average")
+        labels = fcluster(Z, t=_DZ_THRESHOLD, criterion="distance")
+        if len(set(labels)) > _DZ_MAX_SPEAKERS:
+            labels = fcluster(Z, t=_DZ_MAX_SPEAKERS, criterion="maxclust")
+        Dsq = squareform(D)
+        while True:  # fold voices with < 5% of the speech into their nearest neighbour
+            ids = sorted(set(labels))
+            if len(ids) <= 1:
+                break
+            share = {k: W[labels == k].sum() / W.sum() for k in ids}
+            small = min(ids, key=lambda k: share[k])
+            if share[small] >= 0.05:
+                break
+            near = min((k for k in ids if k != small), key=lambda k: Dsq[np.ix_(labels == small, labels == k)].mean())
+            labels[labels == small] = near
+    totals = {k: float(W[labels == k].sum()) for k in set(labels)}
+    rank = {k: i + 1 for i, k in enumerate(sorted(totals, key=lambda k: -totals[k]))}
+    by_seg = {(id(c), s, e): rank[l] for (c, s, e), l in zip(refs, labels)}
+
+    for c, _ in entries:
+        sp_list = c.get("speech", [])
+        for sp in sp_list:
+            sp["speaker"] = by_seg.get((id(c), sp["start"], sp["end"]))
+        # sentences too short to judge take the speaker of the nearest judged sentence in the clip
+        known = [(sp["start"], sp["speaker"]) for sp in sp_list if sp.get("speaker")]
+        for sp in sp_list:
+            if not sp.get("speaker") and known:
+                sp["speaker"] = min(known, key=lambda kv: abs(kv[0] - sp["start"]))[1]
+    n = len(rank)
+    log_fn(
+        f"🗣️ 화자 구분(실험적): {n}명 감지 ("
+        + ", ".join(f"화자 {rank[k]} {totals[k]:.0f}초" for k in sorted(totals, key=lambda k: rank[k]))
+        + f") · 문장 {len(refs)}개 기준, 짧은 말은 가까운 문장의 화자를 따라감"
+    )
+    return n
+
+
+# ── Stabilization ────────────────────────────────────────────────────────────
+# vid.stab two-pass, only where it helps: hand-held phone footage. Gimbal (DJI/Osmo) and action cameras
+# (GoPro/Insta360) are already stabilized in camera, and cuts whose measured shake is small are left alone
+# (stabilizing zooms in slightly). Motion is detected at ~960 px and the transforms are scaled to the
+# source resolution, so detection costs a fraction of a full-resolution pass.
+
+STAB_SKIP_DEVICE_KEYS = ("dji", "osmo", "gopro", "insta360", "action")
+_STAB_DETECT_W = 960
+_STAB_MIN_JITTER_PCT = 0.3  # high-frequency shake (RMS, % of frame width) below which a cut is left alone
+_VIDEO_DIMS_CACHE: Dict[str, Tuple[int, int, float]] = {}
+_LM_RX = re.compile(r"\(LM (-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) ([^ ]+) ([^)]+)\)")
+
+
+def _video_dims(path: str) -> Tuple[int, int, float]:
+    if path not in _VIDEO_DIMS_CACHE:
+        w = h = 0
+        fps = 30.0
+        try:
+            out = subprocess.check_output(
+                ["ffprobe", "-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=width,height,avg_frame_rate",
+                 "-of", "csv=p=0", path],
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", "ignore").strip().split(",")
+            w, h = int(out[0]), int(out[1])
+            num, _, den = out[2].partition("/")
+            fps = float(num) / float(den or 1) if float(den or 1) else 30.0
+        except Exception:
+            pass
+        _VIDEO_DIMS_CACHE[path] = (w, h, fps)
+    return _VIDEO_DIMS_CACHE[path]
+
+
+def stabilization_device_ok(path: str) -> Tuple[bool, str]:
+    device = probe_media_item(path).get("device", "")
+    return not any(k in device.lower() for k in STAB_SKIP_DEVICE_KEYS), device
+
+
+def prepare_cut_stabilization(src: str, start: float, total: float, rotation: int, workdir: str, tag: str) -> Tuple[str, float]:
+    """
+    Detect the shake of src[start, start+total] and write a full-resolution transforms file.
+    Returns (filter string ending in ',' to put after the source-side filters, or "" when not needed;
+             measured jitter in % of frame width).
+    """
+    w, h, fps = _video_dims(src)
+    if not w:
+        return "", 0.0
+    if rotation in (90, 270):
+        w, h = h, w
+    factor = w / _STAB_DETECT_W if w > _STAB_DETECT_W else 1.0
+    det_trf = os.path.join(workdir, f"{tag}_detect.trf")
+    vf = "".join(f"{f}," for f in (rotation_vf(rotation),) if f)
+    if factor > 1.0:
+        vf += f"scale={_STAB_DETECT_W}:-2,"
+    vf += f"format=yuv420p,vidstabdetect=result={_ff_filter_path(det_trf)}:shakiness=6:accuracy=9:fileformat=1"
+    res = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{total:.3f}", "-i", src, "-vf", vf, "-f", "null", "-"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if res.returncode != 0 or not os.path.exists(det_trf):
+        return "", 0.0
+    with open(det_trf, "r", encoding="ascii", errors="ignore") as f:
+        lines = f.read().splitlines()
+    motion = []
+    for ln in lines:
+        if ln.startswith("Frame "):
+            lms = _LM_RX.findall(ln)
+            motion.append((np.median([int(m[0]) for m in lms]), np.median([int(m[1]) for m in lms])) if lms else (0.0, 0.0))
+    if len(motion) < 8:
+        return "", 0.0
+    path = np.cumsum(np.asarray(motion, dtype=float), axis=0)
+    sigma = max(2.0, fps * 0.25)
+    kx = np.exp(-0.5 * (np.arange(-int(3 * sigma), int(3 * sigma) + 1) / sigma) ** 2)
+    kx /= kx.sum()
+    padded = np.pad(path, ((len(kx) // 2, len(kx) // 2), (0, 0)), mode="edge")
+    smooth = np.stack([np.convolve(padded[:, i], kx, mode="valid") for i in range(2)], axis=1)
+    jitter = float(np.sqrt(((path - smooth) ** 2).sum(axis=1).mean()) / (w / factor) * 100.0)
+    if jitter < _STAB_MIN_JITTER_PCT:
+        return "", jitter
+
+    def scale_lm(m: "re.Match") -> str:
+        vals = [int(round(int(m.group(i)) * factor)) for i in range(1, 6)]
+        return f"(LM {vals[0]} {vals[1]} {vals[2]} {vals[3]} {max(1, vals[4])} {m.group(6)} {m.group(7)})"
+
+    full_trf = os.path.join(workdir, f"{tag}.trf")
+    with open(full_trf, "w", encoding="ascii") as f:
+        f.write("\n".join(_LM_RX.sub(scale_lm, ln) for ln in lines) + "\n")
+    smoothing = int(np.clip(round(fps * 0.5), 10, 40))
+    return (
+        f"format=yuv420p,vidstabtransform=input={_ff_filter_path(full_trf)}:smoothing={smoothing}:optzoom=1:interpol=3,",
+        jitter,
+    )
+
+
+# ── Vertical auto reframe (9:16) ─────────────────────────────────────────────
+# A 1080x1920 version of the finished edit: a 9:16 window follows the people in each shot (YuNet face
+# detector, falling back to spectral-residual saliency), smoothed inside each shot and re-centred at cuts.
+# The window starts below the burned-in date/logo band and a vertical-sized HUD is drawn on top instead.
+
+REFRAME_W, REFRAME_H = 1080, 1920
+_YUNET_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "face_detection_yunet_2023mar.onnx")
+_RF_FPS = 5.0
+_RF_AW = 480
+
+
+def _spectral_residual_saliency(gray: np.ndarray) -> np.ndarray:
+    small = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float64)
+    spec = np.fft.fft2(small)
+    log_amp = np.log(np.abs(spec) + 1e-9)
+    residual = log_amp - cv2.blur(log_amp, (3, 3))
+    sal = np.abs(np.fft.ifft2(np.exp(residual + 1j * np.angle(spec)))) ** 2
+    sal = cv2.GaussianBlur(sal, (0, 0), 2.5)
+    return cv2.resize(sal, (gray.shape[1], gray.shape[0]))
+
+
+def _reframe_targets(
+    video: str, start: float, aspect: float, stop_check_fn=None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """(times, subject x centre 0..1, picture extent [left, right] 0..1 (pillarbox bars excluded), frames with
+    faces) sampled at _RF_FPS from `start`."""
+    aw = _RF_AW
+    ah = int(round(aw / aspect / 2)) * 2
+    proc = subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-hwaccel", "auto", "-ss", f"{start:.3f}", "-i", video,
+         "-vf", f"fps={_RF_FPS},scale={aw}:{ah},format=bgr24", "-f", "rawvideo", "-"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    det = None
+    if os.path.exists(_YUNET_MODEL) and hasattr(cv2, "FaceDetectorYN"):
+        try:
+            det = cv2.FaceDetectorYN.create(_YUNET_MODEL, "", (aw, ah), 0.7, 0.3, 50)
+        except Exception:
+            det = None
+    xs, extents, n_face = [], [], 0
+    xx = np.arange(aw)
+    fsize = aw * ah * 3
+    try:
+        while True:
+            if stop_check_fn and stop_check_fn():
+                raise RuntimeError("사용자에 의해 작업이 중단되었습니다.")
+            buf = proc.stdout.read(fsize)
+            if len(buf) < fsize:
+                break
+            frame = np.frombuffer(buf, np.uint8).reshape(ah, aw, 3)
+            lit = np.where(frame[int(ah * 0.12) :].max(axis=(0, 2)) > 24)[0]  # below the date/logo band
+            extents.append((lit[0] / aw, (lit[-1] + 1) / aw) if len(lit) else (0.0, 1.0))
+            faces = None
+            if det is not None:
+                try:
+                    _, faces = det.detect(frame)
+                except Exception:
+                    faces = None
+            if faces is not None and len(faces):
+                # bigger and surer faces pull harder: area x score
+                wts = faces[:, 2] * faces[:, 3] * faces[:, 14]
+                cx = faces[:, 0] + faces[:, 2] / 2.0
+                xs.append(float((cx * wts).sum() / wts.sum() / aw))
+                n_face += 1
+            else:
+                sal = _spectral_residual_saliency(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                col = sal.sum(axis=0)
+                x_sal = float((col * xx).sum() / max(col.sum(), 1e-9) / aw)
+                xs.append(0.5 + (x_sal - 0.5) * 0.6)  # saliency is noisy: only lean toward it
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    times = np.arange(len(xs)) / _RF_FPS
+    return times, np.asarray(xs, dtype=float), np.asarray(extents, dtype=float).reshape(-1, 2), n_face
+
+
+def _reframe_path(times: np.ndarray, xs: np.ndarray, shot_starts: List[float], extents: np.ndarray, win: float) -> np.ndarray:
+    """
+    Per-shot smoothed subject path: Gaussian (1 s) inside a shot, a fresh start at every cut. The window
+    (width `win`, 0..1) is kept inside the shot's picture, so a pillarboxed portrait clip never shows its bars.
+    """
+    out = np.empty_like(xs)
+    bounds = sorted(set([0.0] + [t for t in shot_starts if t > 0] + [float(times[-1]) + 1.0]))
+    sigma = _RF_FPS * 1.0
+    k = np.exp(-0.5 * (np.arange(-int(3 * sigma), int(3 * sigma) + 1) / sigma) ** 2)
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        idx = np.where((times >= a) & (times < b))[0]
+        if not len(idx):
+            continue
+        seg = xs[idx]
+        if len(seg) < _RF_FPS * 1.5:
+            out[idx] = np.median(seg)
+            continue
+        kk = k[: min(len(k), 2 * (len(seg) // 2) - 1)] if len(seg) < len(k) else k
+        kk = kk / kk.sum()
+        padded = np.pad(seg, (len(kk) // 2, len(kk) // 2), mode="edge")
+        out[idx] = np.convolve(padded, kk, mode="valid")
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        idx = np.where((times >= a) & (times < b))[0]
+        if not len(idx):
+            continue
+        left, right = np.median(extents[idx, 0]), np.median(extents[idx, 1])
+        if right - left >= win:
+            out[idx] = np.clip(out[idx], left + win / 2, right - win / 2)
+        else:
+            out[idx] = (left + right) / 2
+    # and per sample, for frames whose picture differs from their shot's (dissolves, photo slides)
+    fits = extents[:, 1] - extents[:, 0] >= win
+    out = np.where(fits, np.clip(out, extents[:, 0] + win / 2, np.maximum(extents[:, 0] + win / 2, extents[:, 1] - win / 2)), out)
+    return out
+
+
+def create_hlg_dimmed_png(src_png: str, dst_png: str) -> None:
+    """Overlay graphics for HLG pixels: full-scale white would be the HDR peak, so dim to the ~75% reference white."""
+    with Image.open(src_png) as im:
+        r, g, b, a = im.convert("RGBA").split()
+        dim = lambda ch: ch.point(lambda v: int(v * 0.75))
+        Image.merge("RGBA", (dim(r), dim(g), dim(b), a)).save(dst_png)
+
+
+def create_vertical_reframe(
+    clean_mp4: str,
+    out_mp4: str,
+    *,
+    start_sec: float,
+    shot_starts: List[float],
+    hud_band: bool,
+    date_text: str,
+    logo_text: str,
+    enable_hud: bool,
+    video_codec: str,
+    video_bitrate_bps: int,
+    output_dr: str,
+    workdir: str,
+    log_fn: Callable[[str], None] = print,
+    progress_fn: Optional[Callable[[float, str], None]] = None,
+    stop_check_fn: Optional[Callable[[], bool]] = None,
+) -> bool:
+    """Render the 9:16 version of the finished edit. shot_starts are cut start times on the edit timeline."""
+    w, h, _ = _video_dims(clean_mp4)
+    if not w or not h:
+        return False
+    band = int(round(h * 0.1 / 2)) * 2 if hud_band else 0
+    ch = h - band
+    cw = int(round(ch * REFRAME_W / REFRAME_H / 2)) * 2
+    if cw >= w:
+        log_fn("ℹ️ 원본이 이미 세로에 가까워 세로 리프레임을 건너뜁니다.")
+        return False
+    if progress_fn:
+        progress_fn(96.0, "세로 쇼츠(9:16) 리프레임: 얼굴·피사체 추적 중...")
+    times, xs, extents, n_face = _reframe_targets(clean_mp4, start_sec, w / h, stop_check_fn)
+    if not len(xs):
+        return False
+    path = _reframe_path(times, xs, [t - start_sec for t in shot_starts], extents, cw / w)
+    x_px = np.clip(np.round(path * w - cw / 2.0), 0, w - cw).astype(int)
+    # sendcmd: re-aim the crop 10x a second (linear between analysis samples)
+    t_cmd = np.arange(0.0, float(times[-1]) + 1.0 / _RF_FPS, 0.1)
+    x_cmd = np.round(np.interp(t_cmd, times, x_px)).astype(int)
+    cmd_file = os.path.join(workdir, "reframe.cmd")
+    with open(cmd_file, "w", encoding="ascii") as f:
+        last = None
+        for t, x in zip(t_cmd, x_cmd):
+            if x != last:
+                f.write(f"{t:.2f} crop x {x};\n")
+                last = x
+    log_fn(
+        f"📱 세로 리프레임 경로: {len(xs)}개 분석 프레임 중 얼굴 {n_face}개({n_face * 100 // max(1, len(xs))}%), "
+        f"나머지는 시각 주목도(saliency) · 샷 {len(shot_starts)}개마다 새로 조준"
+    )
+
+    out_pix = output_pix_fmt(output_dr)
+    graph = (
+        f"[0:v]sendcmd=f={_ff_filter_path(cmd_file)},crop=w={cw}:h={ch}:x={int(x_cmd[0])}:y={band},"
+        f"scale={REFRAME_W}:{REFRAME_H}:flags=lanczos"
+    )
+    inputs = ["-ss", f"{start_sec:.3f}", "-i", clean_mp4]
+    if enable_hud:
+        hud_v = os.path.join(workdir, "hud_vertical.png")
+        create_hud_overlay_png(hud_v, date_name=date_text, logo_text=logo_text, out_width=REFRAME_W, out_height=REFRAME_H, ui_scale=1.0)
+        if output_dr == "hlg":
+            create_hlg_dimmed_png(hud_v, hud_v)
+        inputs += ["-i", hud_v]
+        graph += "[b];[b][1:v]overlay=0:0:format=auto"
+    graph += f",format={out_pix}[v]"
+    bps = int(min(video_bitrate_bps, max(8_000_000, video_bitrate_bps * (REFRAME_W * REFRAME_H) / (w * h) * 1.3)))
+    is_hevc = ("hevc" in video_codec.lower()) or ("265" in video_codec.lower())
+    part = out_mp4[:-4] + ".partial.mp4"
+    if progress_fn:
+        progress_fn(98.0, f"세로 쇼츠(9:16) {REFRAME_W}x{REFRAME_H} 렌더링 중...")
+    res = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", graph, "-map", "[v]", "-map", "0:a?",
+         *_build_vcodec_args(video_codec, bps, output_dr), *_AAC_ARGS, *(["-tag:v", "hvc1"] if is_hevc else []),
+         "-movflags", "+faststart", part],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if res.returncode != 0 or not os.path.exists(part):
+        err = res.stderr.decode("utf-8", "ignore").strip().splitlines()[-2:]
+        log_fn(f"⚠️ 세로 쇼츠 렌더링 실패: {' / '.join(err)}")
+        return False
+    os.replace(part, out_mp4)
+    return True
+
+
 def detect_shot_boundaries_from_bgr_stream(
     bgr_frames: List[np.ndarray],
     fps: float = 4.0,
@@ -2423,14 +3316,15 @@ def create_hud_overlay_png(
     logo_text: str,
     out_width: int = 1920,
     out_height: int = 1080,
+    ui_scale: Optional[float] = None,
 ):
     """
-    Create a WxH transparent RGBA PNG with:
+    Create a WxH transparent RGBA PNG with (ui_scale: size of the boxes, default height / 1080):
     - Top-Left: Video Date (좌측 상단 영상 날짜)
     - Top-Right: Family/Channel Logo (우측 상단 로고: 윰탱해윤해진이네)
     """
     W, H = int(out_width), int(out_height)
-    s_fac = H / 1080.0
+    s_fac = float(ui_scale) if ui_scale else H / 1080.0
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
 
@@ -3078,10 +3972,18 @@ def build_subtitles_for_timeline(
     intro_offset_sec: float = 3.0,
     max_sub_chars: int = 28,
     sub_font_size: int = 52,
+    srt_speaker_path: str = "",
 ) -> Tuple[int, int]:
+    """
+    Write the full SRT (scene tags + speech), the speech-only SRT and the ASS used for burn-in.
+    When sentences carry a "speaker" label (diarization found 2+ voices) and srt_speaker_path is given,
+    also write a speech SRT with "[화자 N]" prefixes, and color each speaker's lines in the ASS.
+    """
     timeline_cursor = float(intro_offset_sec)
     srt_entries = []
     speech_only_entries = []
+    speaker_entries = []
+    n_speakers = len({sp.get("speaker") for c in analysis["clips"] for sp in c.get("speech", []) if sp.get("speaker")})
     ass_events = []
     prev_hm = ""
 
@@ -3130,13 +4032,17 @@ def build_subtitles_for_timeline(
                         tl_e = min(timeline_cursor + iv_dur, tl_s + 1.1)
                     chunks = _split_subtitle_chunks(sp["text"].strip(), max_chars=max_sub_chars)
                     chunk_dur = (tl_e - tl_s) / max(1, len(chunks))
+                    spk = sp.get("speaker") if n_speakers >= 2 else None
+                    color = f"{{\\c{SPEAKER_ASS_COLORS[(spk - 1) % len(SPEAKER_ASS_COLORS)]}}}" if spk else ""
                     for c_i, ch_text in enumerate(chunks):
                         cs = tl_s + c_i * chunk_dur
                         ce = tl_s + (c_i + 1) * chunk_dur
                         srt_entries.append((cs, ce, ch_text))
                         speech_only_entries.append((cs, ce, ch_text))
+                        if spk:
+                            speaker_entries.append((cs, ce, f"[화자 {spk}] {ch_text}"))
                         ass_events.append(
-                            f"Dialogue: 0,{format_ass_time(cs)},{format_ass_time(ce)},Speech,,0,0,0,,{ch_text}"
+                            f"Dialogue: 0,{format_ass_time(cs)},{format_ass_time(ce)},Speech,,0,0,0,,{color}{ch_text}"
                         )
             timeline_cursor += iv_dur
 
@@ -3149,6 +4055,12 @@ def build_subtitles_for_timeline(
     with open(srt_speech_path, "w", encoding="utf-8-sig") as f:
         for i, (s, e, text) in enumerate(speech_only_entries, 1):
             f.write(f"{i}\n{format_srt_time(s)} --> {format_srt_time(e)}\n{text}\n\n")
+
+    if srt_speaker_path and speaker_entries:
+        speaker_entries.sort(key=lambda x: (x[0], x[1]))
+        with open(srt_speaker_path, "w", encoding="utf-8-sig") as f:
+            for i, (s, e, text) in enumerate(speaker_entries, 1):
+                f.write(f"{i}\n{format_srt_time(s)} --> {format_srt_time(e)}\n{text}\n\n")
 
     ass_header = f"""[Script Info]
 ScriptType: v4.00+
@@ -3389,12 +4301,14 @@ def _build_cut_render_cmd(
     out_main: str,
     out_handle: str = "",
     tail_vf: str = "format=yuv420p",
+    audio_gain_db: Optional[float] = None,
 ) -> List[str]:
     """
     One ffmpeg command for a cut (video or photo slide). With handle > 0 (video only) it also writes
     out_handle: the next `handle` seconds of source past the cut's out point, processed by exactly the
     same graph (color, HDR tone map, rotation, HUD, loudness, BGM), so the next join can dissolve out of
     moving footage instead of a frozen frame and crossfade the sound.
+    audio_gain_db: the clip's fixed loudness-match gain (None = loudnorm on this cut alone).
     """
     total = dur + (handle if not is_photo else 0.0)
     if is_photo:
@@ -3432,7 +4346,7 @@ def _build_cut_render_cmd(
         a = f"[{bgm_idx}:a]{photo_bgm_af}"
     else:
         src_a = "[0:a]" if has_audio else f"[{null_idx}:a]"
-        chain = "highpass=f=85,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000" if has_audio else "anull"
+        chain = clip_audio_chain(audio_gain_db) if has_audio else "anull"
         if bgm_idx is not None:
             a = (
                 f"{src_a}{chain}[va];[{bgm_idx}:a]volume={bgm_vol:.3f},aresample=48000[ba];"
@@ -3668,6 +4582,11 @@ def run_autocut_pipeline(
     output_dynamic_range: str = "sdr",
     auto_color_balance: bool = True,
     display_date: str = "",
+    color_match: bool = True,
+    loudness_match: bool = True,
+    speaker_diarization: bool = True,
+    stabilize: bool = False,
+    vertical_reframe: bool = False,
     log_fn: Callable[[str], None] = print,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     stop_check_fn: Optional[Callable[[], bool]] = None,
@@ -3681,6 +4600,11 @@ def run_autocut_pipeline(
         HLG clips kept, PQ converted, SDR clips/photos/intro placed at the 203-nit HDR reference white).
     auto_color_balance: per-clip HDR brightness/black/saturation balance picked with the CLIP aesthetic model.
     display_date: date text for the top-left HUD and the intro ("" = folder-name date or earliest shooting date).
+    color_match: move every clip part of the way toward the edit's common look (Oklab tonal-range tint + chroma).
+    loudness_match: one fixed gain per clip from its integrated loudness (off = loudnorm on every cut).
+    speaker_diarization: label who speaks each sentence (speaker SRT + speaker colors in burned subtitles).
+    stabilize: vid.stab on shaky hand-held phone cuts (gimbal/action cameras and HDR-in-HLG clips skipped).
+    vertical_reframe: also render a 1080x1920 version whose 9:16 window follows faces / the subject.
     Models:
       1) Faster-Whisper large-v3-turbo (Speech & VAD)
       2) CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5)
@@ -4032,10 +4956,7 @@ def run_autocut_pipeline(
         # HLG reference white (~75% signal) instead of full-scale white (= the HDR peak)
         hud_png_hdr = os.path.join(tmpdir, "hud_overlay_hlg.png")
         if enable_hud and out_dr == "hlg" and os.path.exists(hud_png):
-            with Image.open(hud_png) as hud_im:
-                r, g, b, a = hud_im.convert("RGBA").split()
-                dim = lambda ch: ch.point(lambda v: int(v * 0.75))
-                Image.merge("RGBA", (dim(r), dim(g), dim(b), a)).save(hud_png_hdr)
+            create_hlg_dimmed_png(hud_png, hud_png_hdr)
 
         # Tail of the previous segment that the next cut dissolves out of: a real-footage handle
         # (with audio) after a video cut, or a still of the last frame after the intro / a photo.
@@ -4056,6 +4977,35 @@ def run_autocut_pipeline(
             )
         for c in clips_meta:
             c["auto_color"] = auto_color_map.get(c.get("path", ""))
+
+        # Color-profile filters (DJI D-Log restore) per clip: needed by the color match measurement too
+        color_filter_cache: Dict[str, str] = {}
+        for c in clips_meta:
+            if c.get("type", "video") == "video" and c.get("path") and c["path"] not in color_filter_cache:
+                color_filter_cache[c["path"]] = get_color_profile_filter(color_profile, c["path"], log_fn=log_fn) or ""
+
+        color_match_map: Dict[str, str] = {}
+        if color_match:
+            color_match_map = ensure_color_match(
+                clips_meta,
+                auto_color_map,
+                color_filter_cache,
+                out_dr,
+                os.path.join(output_dir, f"{date_name}_컬러매치.json"),
+                tmpdir,
+                log_fn=log_fn,
+                progress_fn=progress_fn,
+            )
+        loudness_map: Dict[str, float] = {}
+        if loudness_match:
+            loudness_map = ensure_loudness(
+                clips_meta, os.path.join(output_dir, f"{date_name}_음량.json"), log_fn=log_fn, progress_fn=progress_fn
+            )
+        n_speakers = 0
+        if speaker_diarization:
+            n_speakers = diarize_speakers(
+                clips_meta, os.path.join(output_dir, f"{date_name}_화자분석.json"), log_fn=log_fn, progress_fn=progress_fn
+            )
 
         if enable_intro:
             if progress_fn:
@@ -4112,6 +5062,7 @@ def run_autocut_pipeline(
         # Step 3: Build SRT and ASS subtitles (offset by intro_dur = 3.0s)
         srt_full = os.path.join(output_dir, f"{date_name}_전체자막(필모라용).srt")
         srt_speech = os.path.join(output_dir, f"{date_name}_음성자막(필모라용).srt")
+        srt_speaker = os.path.join(output_dir, f"{date_name}_화자자막(필모라용).srt")
         ass_tmp = os.path.join(tmpdir, "subtitles.ass")
 
         n_all, n_sp = build_subtitles_for_timeline(
@@ -4123,8 +5074,11 @@ def run_autocut_pipeline(
             intro_offset_sec=intro_dur,
             max_sub_chars=max_sub_chars,
             sub_font_size=sub_font_size,
+            srt_speaker_path=srt_speaker if n_speakers >= 2 else "",
         )
         log_fn(f"📝 자막 파일 생성 완료: 전체 자막 {n_all}개 (음성 대화 {n_sp}개) -> {os.path.basename(srt_full)}")
+        if n_speakers >= 2 and os.path.exists(srt_speaker):
+            log_fn(f"🗣️ 화자 구분 자막: {os.path.basename(srt_speaker)} ([화자 N] 표시 · 자막 입히기 시 화자별 색상)")
 
         flat_cuts = []
         for clip in clips_meta:
@@ -4134,8 +5088,9 @@ def run_autocut_pipeline(
 
         total_cuts = len(flat_cuts)
         rng = random.Random(42)
-        color_filter_cache: Dict[str, str] = {}
         hdr_cache: Dict[str, Tuple[List[str], str]] = {}
+        stab_device_cache: Dict[str, Tuple[bool, str]] = {}
+        stab_counts = {"applied": 0, "calm": 0, "skipped_device": 0, "skipped_hdr": 0}
 
         # Plan every join up front: a cut has to know how the next one leaves it so it can render that
         # much real footage past its out point (a "handle") for the dissolve and the audio crossfade.
@@ -4179,10 +5134,9 @@ def run_autocut_pipeline(
             tail_hw, tail_vf = sdr_to_output_vf(out_dr)
             clip_hud = hud_png
             if ctype == "video":
-                if fpath not in color_filter_cache:
-                    cf_str = get_color_profile_filter(color_profile, fpath, log_fn=log_fn)
-                    color_filter_cache[fpath] = f",{cf_str}" if cf_str else ""
-                clip_eq_chain = color_filter_cache[fpath] + eq_chain
+                # color-profile restore -> color match -> style look
+                clip_eq_chain = "".join(f",{f}" for f in (color_filter_cache.get(fpath, ""), color_match_map.get(fpath, "")) if f)
+                clip_eq_chain += eq_chain
                 dr = detect_dynamic_range(fpath)
                 if fpath not in hdr_cache:
                     adj = auto_color_map.get(fpath)
@@ -4206,8 +5160,9 @@ def run_autocut_pipeline(
                 hdr_hw_args, tm_vf = hdr_cache[fpath]
                 if out_dr == "hlg" and dr["range"] != "SDR":
                     # HDR source into an HLG master: stays HDR end to end. The 8-bit-only style/eq filters
-                    # would band 10-bit footage, so they are skipped; the HUD uses the dimmed copy.
-                    clip_eq_chain = ""
+                    # would band 10-bit footage, so they are skipped (the color match LUT works on 10-bit
+                    # and was built for HLG pixels); the HUD uses the dimmed copy.
+                    clip_eq_chain = f",{color_match_map[fpath]}" if fpath in color_match_map else ""
                     tail_hw, tail_vf = [], f"format={out_pix}"
                     clip_hud = hud_png_hdr
                 # Source-side filters before scaling: HDR tone map / PQ->HLG, then the manual timeline rotation
@@ -4253,6 +5208,28 @@ def run_autocut_pipeline(
 
             if ctype == "video":
                 src, pre_vf, post_vf, photo_bgm_af = fpath, hdr_head, clip_eq_chain, ""
+                if stabilize:
+                    if fpath not in stab_device_cache:
+                        stab_device_cache[fpath] = stabilization_device_ok(fpath)
+                    if out_dr == "hlg" and dr["range"] != "SDR":
+                        stab_counts["skipped_hdr"] += 1  # vid.stab is 8-bit only
+                    elif not stab_device_cache[fpath][0]:
+                        stab_counts["skipped_device"] += 1
+                    else:
+                        if progress_fn:
+                            progress_fn(
+                                50.0 + (cut_idx / max(1, total_cuts)) * 38.0,
+                                f"손떨림 분석 중 ({cut_idx}/{total_cuts}): {fname} ({s:.1f}s~{e:.1f}s)",
+                            )
+                        stab_vf, jitter = prepare_cut_stabilization(
+                            fpath, s, dur + handle, clip.get("rotation", 0), tmpdir, f"stab_{cut_idx:04d}"
+                        )
+                        if stab_vf:
+                            pre_vf += stab_vf
+                            stab_counts["applied"] += 1
+                            log_fn(f"  🫨 [{fname}] {s:.1f}s~{e:.1f}s 손떨림 {jitter:.2f}% -> 안정화 적용")
+                        else:
+                            stab_counts["calm"] += 1
             else:
                 # Photo segment: normalize orientation (EXIF + upright check + blurred frame) & play BGM at normal volume (bgm_photo_vol)
                 norm_photo = os.path.join(tmpdir, f"photo_norm_{cut_idx:04d}.jpg")
@@ -4294,6 +5271,7 @@ def run_autocut_pipeline(
                 out_main=raw_seg,
                 out_handle=handle_seg,
                 tail_vf=tail_vf,
+                audio_gain_db=loudness_map.get(fpath, 0.0) if (loudness_match and ctype == "video") else None,
             )
             res = subprocess.run(cmd_raw, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if res.returncode != 0:
@@ -4343,6 +5321,12 @@ def run_autocut_pipeline(
                 "🎬 트랜지션 적용 완료 (실제 영상 겹침 디졸브 + 오디오 크로스페이드): "
                 + ", ".join(f"{k} {v}" for k, v in sorted(used_counts.items(), key=lambda kv: -kv[1]))
                 + " · 마지막 장면 블랙 페이드아웃"
+            )
+        if stabilize:
+            log_fn(
+                f"🫨 손떨림 보정: {stab_counts['applied']}컷 안정화 · 흔들림 적어 그대로 {stab_counts['calm']}컷 · "
+                f"짐벌/액션캠 제외 {stab_counts['skipped_device']}컷"
+                + (f" · HLG 원본(10-bit) 제외 {stab_counts['skipped_hdr']}컷" if stab_counts["skipped_hdr"] else "")
             )
 
         concat_txt = os.path.join(tmpdir, "concat_list.txt")
@@ -4420,6 +5404,36 @@ def run_autocut_pipeline(
             os.replace(subbed_part, subbed_mp4)
             log_fn(f"✅ 자막 포함 완성본 영상 저장 완료: {subbed_mp4}")
 
+        vertical_mp4 = os.path.join(output_dir, f"{date_name}_세로쇼츠_9x16.mp4")
+        made_vertical = False
+        if vertical_reframe and os.path.exists(clean_mp4):
+            log_fn(f"📱 세로 쇼츠(9:16 {REFRAME_W}x{REFRAME_H}) 버전 만드는 중: 얼굴·피사체를 따라 화면을 자동으로 이동")
+            # cut start times on the edit timeline (the window re-aims at each one); skip the intro title card
+            shot_starts, t = [], intro_dur
+            for _clip, cs, ce in flat_cuts:
+                shot_starts.append(t)
+                t += round(ce - cs, 2)
+            start_v = intro_dur + (plans[0][1] if (enable_intro and plans) else 0.0)
+            made_vertical = create_vertical_reframe(
+                clean_mp4,
+                vertical_mp4,
+                start_sec=start_v,
+                shot_starts=shot_starts,
+                hud_band=enable_hud,
+                date_text=shown_date,
+                logo_text=logo_text,
+                enable_hud=enable_hud,
+                video_codec=video_codec,
+                video_bitrate_bps=video_bitrate_bps,
+                output_dr=out_dr,
+                workdir=tmpdir,
+                log_fn=log_fn,
+                progress_fn=progress_fn,
+                stop_check_fn=stop_check_fn,
+            )
+            if made_vertical:
+                log_fn(f"✅ 세로 쇼츠 영상 저장 완료: {vertical_mp4}")
+
         if not export_filmora_clean and burn_subtitles and os.path.exists(clean_mp4):
             os.remove(clean_mp4)
 
@@ -4433,6 +5447,8 @@ def run_autocut_pipeline(
         analysis_summary["clean_mp4"] = clean_mp4 if export_filmora_clean else ""
         analysis_summary["srt_full"] = srt_full
         analysis_summary["srt_speech"] = srt_speech
+        analysis_summary["srt_speaker"] = srt_speaker if (n_speakers >= 2 and os.path.exists(srt_speaker)) else ""
+        analysis_summary["vertical_mp4"] = vertical_mp4 if made_vertical else ""
         return analysis_summary
 
 

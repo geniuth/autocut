@@ -14,6 +14,7 @@
 | [`autocut_timeline.py`](file:///d:/workspace/autocut/autocut_timeline.py) | **프리미어식 하단 타임라인** (썸네일 클립 배치, 드래그 순서 변경, 기기 시간 보정, 클립 회전, `편집결과_<날짜>/<날짜>_타임라인순서.json` 저장) |
 | `autocut_session.json` (자동 생성, git 제외) | 마지막 작업 상태(설정·선택 폴더) — 다음 실행 때 자동 복원 |
 | `assets/autocut_icon.ico` / `.png` | 시네마 카메라 프로그램 아이콘 (창·작업 표시줄·스플래시) |
+| `assets/face_detection_yunet_2023mar.onnx` | 세로 쇼츠 리프레임용 얼굴 검출 모델 (OpenCV Zoo YuNet, MIT 라이선스, 230KB) |
 | [`AutoCut_Studio.vbs`](file:///d:/workspace/autocut/AutoCut_Studio.vbs) | **무콘솔(Windowless) 백그라운드 런처** (검은색 `cmd` 창 없이 즉시 GUI만 깔끔하게 실행) |
 | [`AutoCut_Studio.bat`](file:///d:/workspace/autocut/AutoCut_Studio.bat) | 배치 파일 실행 런처 (`AutoCut_Studio.vbs` 호출) |
 | [`custom_styles.json`](file:///d:/workspace/autocut/custom_styles.json) | 유튜브 URL 또는 로컬 레퍼런스 영상을 분석해 학습된 **맞춤형 편집 스타일 프리셋** 저장소 |
@@ -31,13 +32,15 @@ flowchart TD
     D --> D1["🎙️ FFT 노이즈 제거 + Faster-Whisper 한국어 음성인식(STT)"]
     D --> D2["👁️ OpenCV 키프레임 비전 분석 (얼굴 검출 · 선명도 · 색감 · 흔들림 감점)"]
     D1 & D2 --> E["✂️ 4. 편집 모드별 최적 컷 구간 선택 + 편집 길이 상한 (원본의 60% 이하)"]
-    E --> F["🌟 5. 정방향 베스트 샷 추출 & 3초 인트로 생성 (반투명 타이틀 + 하얀 테두리)"]
-    F --> G["🎵 6. 클립별 렌더링 (HDR 톤매핑·회전) + 상단 날짜/로고 HUD + 동적 BGM 믹싱 (영상 6% / 사진 38%)"]
+    E --> E2["🎨 HDR 자동 색 균형 · 기기 간 색 맞춤 · 클립 음량 측정 · 화자 구분(옵션)"]
+    E2 --> F["🌟 5. 정방향 베스트 샷 추출 & 3초 인트로 생성 (반투명 타이틀 + 하얀 테두리)"]
+    F --> G["🎵 6. 클립별 렌더링 (HDR 톤매핑·회전·손떨림 보정·색 맞춤 LUT) + 상단 날짜/로고 HUD + 클립 고정 게인 음량 + 동적 BGM 믹싱 (영상 6% / 사진 38%)"]
     G --> H["✨ 7. 상황별 xfade 트랜지션 (실제 영상 겹침) + 오디오 크로스페이드 + 마지막 블랙 페이드아웃"]
     H --> I["🎬 8. 최종 출력 (HEVC H.265 NVENC / 지정 해상도·FPS·bps)"]
     I --> O1["✅ 자막 포함 완성본 MP4"]
     I --> O2["✅ 필모라(Filmora) 연동용 무자막 MP4 + 전체/음성 SRT 자막"]
     I --> O3["✅ 베스트샷 JPG + 편집분석리포트 JSON"]
+    I --> O4["📱 세로 쇼츠 9:16 (옵션) + 화자 자막 SRT (옵션)"]
 ```
 
 ---
@@ -105,6 +108,16 @@ flowchart TD
   * 점프컷 = 짧은 디졸브/컷, 같은 장면 = 필름 디졸브, 장면 전환(20분 이상·다른 날) = 화이트 딥·라이트 릭·휩 팬(그냥 대화 = 블랙 딥). 프리셋 스타일(빠른 텐션/시네마틱)과 `transition_prob`를 반영합니다.
 * **오디오 크로스페이드**: 영상 컷마다 0.25초 선형 크로스페이드로 '틱' 소리와 뚝 끊김을 없앱니다.
 
+### ④-3 마무리 보정 (v3.0.0 · FilmCraft 아이디어를 ffmpeg + numpy로 재구현)
+* **기기 간 색 맞춤 ([`ensure_color_match`](file:///d:/workspace/autocut/autocut_engine.py), [`write_color_match_lut`](file:///d:/workspace/autocut/autocut_engine.py))**:
+  * 측정: 키프레임 6장을 시청 화면 기준(SDR은 그대로·D-Log 복원 후, HDR은 `_ac_render`로 libplacebo 톤매핑 + 자동 색 균형 후)으로 뽑아 96×54 Oklab으로 변환 → 어두운(`smoothstep(0.55,0.15,L)`)·중간·밝은(`smoothstep(0.45,0.85,L)`) 영역별 평균 a/b와 전체 채도. 피부 픽셀(Oklab 색상 20°~75°)은 가중치 0.2.
+  * 기준: 촬영 시각 ±15분 안의 클립들의 길이 가중 중간값(혼자 찍힌 클립은 보정 안 함). 영역별 a/b를 70%만큼(최대 0.02) 옮기고 채도 배율은 0.85~1.2. 피부색이 평균 8°를 넘게 돌면 이분 탐색으로 강도를 줄임. 순수 검정·흰색은 중립 유지.
+  * 적용: 33³ `.cube` LUT를 `lut3d`로 (색 프로파일 복원 → 색 맞춤 → 스타일 eq 순). HLG 마스터의 HDR 클립은 HLG 신호를 SDR 화면에 대응(기준 백색 75%, BT.2020↔709)시킨 LUT로 10-bit 그대로 처리. LUT는 `원본 + (보정 − 왕복)`이라 보정 0이면 정확히 원본 (실측: yuv↔rgb 왕복 평균 차이 0).
+* **클립 음량 맞춤 ([`ensure_loudness`](file:///d:/workspace/autocut/autocut_engine.py), [`clip_audio_chain`](file:///d:/workspace/autocut/autocut_engine.py))**: `highpass,afftdn,ebur128`로 파일별 통합 음량 측정 → `volume=(−16−I)dB`(−12~+10 dB, −60 LUFS 미만은 0) + `alimiter=limit=0.84:level=0:latency=1`. 핸들(겹침 구간)도 같은 게인이라 크로스페이드에서 음량이 튀지 않음. 끄면 예전 컷별 `loudnorm`. 실측: 5클립 편집본 −16.6 LUFS.
+* **손떨림 보정 ([`prepare_cut_stabilization`](file:///d:/workspace/autocut/autocut_engine.py))**: 기기 이름에 DJI·Osmo·GoPro·Insta360·Action이 있으면 제외. 컷(+핸들) 구간을 회전 적용 후 960px로 `vidstabdetect`(ASCII) → 프레임별 국소 움직임 중간값 경로의 고주파 RMS가 화면 폭 0.3% 이상일 때만, LM 좌표·크기를 원본 해상도 배율로 키운 `.trf`로 `vidstabtransform`(smoothing = fps×0.5, optzoom=1, bicubic)을 톤매핑·회전 뒤·스케일 앞에 적용. 실측: 아이폰 걷는 컷 흔들림 2.52% → 1.36%.
+* **세로 쇼츠 ([`create_vertical_reframe`](file:///d:/workspace/autocut/autocut_engine.py))**: 완성본을 5fps·480px로 디코딩 → YuNet 얼굴(면적×점수 가중 중심), 없으면 스펙트럼 잔차 saliency 중심을 60%만 반영 → 샷별 1초 가우시안 + 샷·프레임별 실제 화면 범위(검은 여백·HUD 띠 제외) 안으로 제한 → `sendcmd`로 0.1초마다 `crop x` 갱신 → 1080×1920 lanczos + 세로용 HUD(`ui_scale=1`, HLG면 75%). 비트레이트는 화소 비율×1.3(최소 8Mbps). 실측(제주 75초): 얼굴 검출 93% 프레임.
+* **화자 구분 ([`diarize_speakers`](file:///d:/workspace/autocut/autocut_engine.py), 실험적)**: 0.6초 이상 문장의 16kHz 음성(긴 문장은 가운데 8초) → `microsoft/wavlm-base-plus-sv` x-vector(정규화, float16 base64 캐시) → 코사인 거리 평균 연결 군집(임계 0.42, 최대 6명) → 말 비중 5% 미만 묶음은 가장 가까운 화자로 → 말한 시간순으로 화자 1, 2… 짧은 문장은 같은 클립의 가장 가까운 문장 화자를 따름. ASS에서 화자별 `\c` 색. (FilmCraft식 MFCC 벡터는 클립마다 장소·마이크가 달라 화자보다 환경으로 묶여 채택하지 않음.)
+
 ---
 
 ### ⑤ 출력 인코딩 사양 (HEVC 기본 · 해상도 · 프레임 · bps 화질)
@@ -147,6 +160,9 @@ flowchart TD
 5. **`YYYY-MM-DD_베스트샷.jpg`**: AI가 추출한 해당 날짜의 베스트 하이라이트 원본 사진
 6. **`YYYY-MM-DD_편집분석리포트.json`**: 클립별 촬영 시각, 채택 구간, 음성 대화 타임스탬프가 기록된 분석 캐시 리포트
 7. **`YYYY-MM-DD_타임라인순서.json`** (타임라인에서 손댄 경우만): 사용자 지정 클립 순서, 기기별 시간 보정, 클립 회전 — [자동 편집 시작] 시 그대로 적용
+8. **`YYYY-MM-DD_세로쇼츠_9x16.mp4`** (옵션, v3.0.0): 얼굴을 따라가는 1080×1920 세로 버전
+9. **`YYYY-MM-DD_화자자막(필모라용).srt`** (옵션, v3.0.0): `[화자 N]` 음성 자막
+10. **분석 캐시** `_자동색보정.json` · `_컬러매치.json` · `_음량.json` · `_화자분석.json`
 
 ---
 
