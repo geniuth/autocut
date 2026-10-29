@@ -1269,21 +1269,50 @@ class AutoCutStudioApp(tk.Tk):
             ai_row, textvariable=self.vlm_status_var, font=(f_family, 9, "bold"), fg="#7f849c", bg=bg_main
         )
         self.vlm_status_lbl.pack(side=tk.LEFT, padx=(14, 0))
+        self._vlm_checking = False
 
-        def _check_vlm():
-            try:
-                from autocut_engine import detect_ollama_vlm_model
-
-                name = detect_ollama_vlm_model(log_fn=lambda _m: None)
-            except Exception:
-                name = None
-            if name:
-                txt, color = f"🦙 Ollama 연결됨: {name}", "#a6e3a1"
-            else:
-                txt, color = "🦙 Ollama 미연결 (CLIP 장면 분류로 대체)", "#f38ba8"
+        def _set_vlm_status(txt: str, color: str):
             self.after(0, lambda: (self.vlm_status_var.set(txt), self.vlm_status_lbl.configure(fg=color)))
 
-        threading.Thread(target=_check_vlm, daemon=True).start()
+        def _check_vlm():
+            # Right after Windows boots, a cold `ollama serve` can take well over the engine's 15 s start wait,
+            # so keep watching the server for a while instead of judging once (the label is also click-to-recheck)
+            import time as _time
+
+            from autocut_engine import _ollama_list_models, detect_ollama_vlm_model
+
+            try:
+                name = None
+                deadline = _time.time() + 120.0
+                started = False
+                while True:
+                    if not started or _ollama_list_models(timeout=1.0) is not None:
+                        name = detect_ollama_vlm_model(log_fn=lambda _m: None)
+                        started = True
+                    if name or _ollama_list_models(timeout=1.0) is not None or _time.time() > deadline:
+                        break
+                    _set_vlm_status("🦙 Ollama 시작 기다리는 중...", "#f9e2af")
+                    _time.sleep(3.0)
+            except Exception:
+                name = None
+            finally:
+                self._vlm_checking = False
+            if name:
+                _set_vlm_status(f"🦙 Ollama 연결됨: {name}", "#a6e3a1")
+            else:
+                _set_vlm_status("🦙 Ollama 미연결 (CLIP 장면 분류로 대체 · 클릭하면 다시 확인)", "#f38ba8")
+
+        def _start_vlm_check(_event=None):
+            if self._vlm_checking:
+                return
+            self._vlm_checking = True
+            self.vlm_status_var.set("🦙 Ollama 확인 중...")
+            self.vlm_status_lbl.configure(fg="#7f849c")
+            threading.Thread(target=_check_vlm, daemon=True).start()
+
+        self.vlm_status_lbl.configure(cursor="hand2")
+        self.vlm_status_lbl.bind("<Button-1>", _start_vlm_check)
+        _start_vlm_check()
 
         folder_card = tk.Frame(main, bg=bg_card, highlightthickness=1, highlightbackground="#313244", padx=14, pady=9)
         folder_card.pack(fill=tk.X, pady=(0, 12))
