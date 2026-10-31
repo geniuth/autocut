@@ -115,6 +115,7 @@ DYNAMIC_RANGE_CHOICES = {
     "HLG HDR (BT.2020 10-bit · HEVC)": "hlg",
 }
 # Written into the work folder on every manual save (Ctrl+S): settings + every date folder's timeline
+EDIT_MODE_LABELS = {"travel": "여행", "talk": "그냥 대화", "highlight": "하이라이트", "drive": "드라이브"}
 FOLDER_SAVE_NAME = "AutoCut_작업저장.autocut.json"
 
 
@@ -570,7 +571,15 @@ class AutoCutStudioApp(tk.Tk):
         self.option_add("*TCombobox*Listbox.font", (base_family, 10))
 
         self.target_dir = tk.StringVar(value=r"D:\편집할영상\2023_제주도여행")
+        # Edit mode per date folder: edit_mode is what the radio buttons show / change (the active folder's mode),
+        # default_edit_mode applies to folders that have no mode of their own (saved under the old "edit_mode" key)
         self.edit_mode = tk.StringVar(value="travel")
+        self.default_edit_mode = tk.StringVar(value="travel")
+        self.folder_edit_modes = {}  # {date folder name: mode}
+        self.mode_folder_var = tk.StringVar(value="")
+        self._mode_folder = ""
+        self._mode_sync = False
+        self._folder_counts = {}
         self.whisper_model = tk.StringVar(value="large-v3-turbo")
         self.denoise_audio = tk.BooleanVar(value=True)
         self.auto_color_balance = tk.BooleanVar(value=True)
@@ -645,6 +654,7 @@ class AutoCutStudioApp(tk.Tk):
                 # Subtitle burn-in became opt-in (default off) in v2.7.0; don't carry the old default over
                 settings.pop("burn_subtitles", None)
             self._apply_settings(settings)
+            self._apply_folder_modes(session)
             self._log_geometry = str(session.get("log_window_geometry", "") or "")
             self._graph_geometry = str(session.get("graph_window_geometry", "") or "")
         self.refresh_date_folders(manual=False)
@@ -654,6 +664,7 @@ class AutoCutStudioApp(tk.Tk):
         self._session_save_job = None
         for var in self._state_vars().values():
             var.trace_add("write", lambda *_: self._schedule_session_save())
+        self.edit_mode.trace_add("write", self._on_edit_mode_changed)
         self.bind("<Control-s>", lambda e: self.save_session(manual=True))
         self._show_splash_and_launch()
 
@@ -929,7 +940,7 @@ class AutoCutStudioApp(tk.Tk):
     def _state_vars(self) -> dict:
         return {
             "target_dir": self.target_dir,
-            "edit_mode": self.edit_mode,
+            "edit_mode": self.default_edit_mode,
             "whisper_model": self.whisper_model,
             "denoise_audio": self.denoise_audio,
             "auto_color_balance": self.auto_color_balance,
@@ -974,6 +985,7 @@ class AutoCutStudioApp(tk.Tk):
             "settings": {k: v.get() for k, v in self._state_vars().items()},
             "selected_folders": [os.path.basename(self._date_folders[i]) for i in sel if i < len(self._date_folders)],
             "active_folder": os.path.basename(self.timeline.folder) if self.timeline.folder else "",
+            "folder_edit_modes": dict(self.folder_edit_modes),
             "log_window_geometry": self.log_win.geometry() if self.log_win.winfo_viewable() else self._log_geometry,
             "graph_window_geometry": self.graph_win.geometry() if self.graph_win.winfo_viewable() else self._graph_geometry,
         }
@@ -1022,6 +1034,78 @@ class AutoCutStudioApp(tk.Tk):
             except Exception:
                 pass
         self.style_desc_var.set(self.all_presets.get(self.style_preset_var.get(), {}).get("desc", ""))
+
+    # ── Edit mode per date folder ────────────────────────────────────────────
+    def _apply_folder_modes(self, state: dict):
+        modes = state.get("folder_edit_modes") or {}
+        self.folder_edit_modes = {str(k): v for k, v in modes.items() if v in EDIT_MODE_LABELS} if isinstance(modes, dict) else {}
+        self._mode_sync = True
+        try:
+            self.edit_mode.set(self.default_edit_mode.get())  # until a folder is shown
+        finally:
+            self._mode_sync = False
+
+    def _folder_mode(self, folder_path: str) -> str:
+        return self.folder_edit_modes.get(os.path.basename(folder_path), self.default_edit_mode.get())
+
+    def _folder_label(self, folder_path: str) -> str:
+        name = os.path.basename(folder_path)
+        v_cnt, p_cnt = self._folder_counts.get(folder_path, (0, 0))
+        mode = self._folder_mode(folder_path)
+        own = "✎ " if name in self.folder_edit_modes else ""
+        return f"📁 {name}   (영상 {v_cnt}개 / 사진 {p_cnt}개)  ·  {own}{EDIT_MODE_LABELS.get(mode, mode)}"
+
+    def _refresh_folder_labels(self):
+        lb = self.date_listbox
+        sel = set(lb.curselection())
+        active = lb.index(tk.ACTIVE)
+        top = lb.yview()[0]
+        for i, path in enumerate(self._date_folders):
+            text = self._folder_label(path)
+            if lb.get(i) != text:
+                lb.delete(i)
+                lb.insert(i, text)
+                if i in sel:
+                    lb.selection_set(i)
+        lb.activate(active)
+        lb.yview_moveto(top)
+
+    def _show_mode_for_folder(self, folder_path: str):
+        """Point the edit-mode radio buttons at this folder."""
+        self._mode_folder = os.path.basename(folder_path)
+        self._mode_sync = True
+        try:
+            self.edit_mode.set(self._folder_mode(folder_path))
+        finally:
+            self._mode_sync = False
+        own = self._mode_folder in self.folder_edit_modes
+        self.mode_folder_var.set(f"📁 {self._mode_folder} 폴더" + (" 전용 모드" if own else " (기본 모드)"))
+
+    def _on_edit_mode_changed(self, *_):
+        if self._mode_sync:
+            return
+        mode = self.edit_mode.get()
+        if not self._mode_folder:
+            self.default_edit_mode.set(mode)
+            return
+        if mode == self.default_edit_mode.get():
+            self.folder_edit_modes.pop(self._mode_folder, None)
+        else:
+            self.folder_edit_modes[self._mode_folder] = mode
+        own = self._mode_folder in self.folder_edit_modes
+        self.mode_folder_var.set(f"📁 {self._mode_folder} 폴더" + (" 전용 모드" if own else " (기본 모드)"))
+        self._refresh_folder_labels()
+        self._schedule_session_save()
+
+    def apply_mode_to_all_folders(self, _event=None):
+        mode = self.edit_mode.get()
+        self.default_edit_mode.set(mode)
+        self.folder_edit_modes.clear()
+        if self._mode_folder:
+            self.mode_folder_var.set(f"📁 {self._mode_folder} 폴더 (기본 모드)")
+        self._refresh_folder_labels()
+        self._schedule_session_save()
+        self.log(f"✂️ 모든 날짜 폴더의 편집 모드를 '{EDIT_MODE_LABELS.get(mode, mode)}'(으)로 맞췄습니다.")
 
     def _restore_selection(self, state: dict):
         names = set(state.get("selected_folders") or [])
@@ -1074,6 +1158,7 @@ class AutoCutStudioApp(tk.Tk):
         if folder_override:
             settings["target_dir"] = folder_override  # the folder may have been moved or renamed since saving
         self._apply_settings(settings)
+        self._apply_folder_modes(state)
         self.refresh_date_folders(manual=False)
         restored = 0
         by_name = {os.path.basename(p): p for p in self._date_folders}
@@ -1404,6 +1489,17 @@ class AutoCutStudioApp(tk.Tk):
 
         mode_box = tk.Frame(col2, bg="#1e1e2e", highlightthickness=1, highlightbackground="#313244", padx=12, pady=6)
         mode_box.pack(fill=tk.X, pady=(0, 8))
+        # The radio buttons edit the mode of the folder shown on the timeline; each folder keeps its own
+        mode_head = tk.Frame(mode_box, bg="#1e1e2e")
+        mode_head.pack(fill=tk.X, pady=(0, 1))
+        tk.Label(mode_head, textvariable=self.mode_folder_var, font=(f_family, 9, "bold"), fg="#f9e2af", bg="#1e1e2e").pack(
+            side=tk.LEFT
+        )
+        apply_all = tk.Label(
+            mode_head, text="↳ 모든 폴더에 적용", font=(f_family, 9, "underline"), fg="#89b4fa", bg="#1e1e2e", cursor="hand2"
+        )
+        apply_all.pack(side=tk.RIGHT)
+        apply_all.bind("<Button-1>", self.apply_mode_to_all_folders)
         self._make_vradio(
             mode_box,
             "여행 (기본값 — 풍경·인물 베스트컷 + 대화 조화)",
@@ -1983,6 +2079,8 @@ class AutoCutStudioApp(tk.Tk):
 
         self.date_listbox.delete(0, tk.END)
         self._date_folders = []
+        self._mode_folder = ""  # set again by _sync_timeline for the folder that ends up shown
+        self.mode_folder_var.set("")
         base = self.target_dir.get().strip()
         if not os.path.isdir(base):
             self.folder_summary_var.set("⚠️ 유효한 작업 폴더를 선택해주세요.")
@@ -2007,7 +2105,8 @@ class AutoCutStudioApp(tk.Tk):
                 total_v += v_cnt
                 total_p += p_cnt
                 folder_summaries.append(f"{d}(영상 {v_cnt}·사진 {p_cnt})")
-                self.date_listbox.insert(tk.END, f"📁 {d}   (영상 {v_cnt}개 / 사진 {p_cnt}개 — 시간순 자동배치)")
+                self._folder_counts[full_d] = (v_cnt, p_cnt)
+                self.date_listbox.insert(tk.END, self._folder_label(full_d))
 
         top_files = [f for f in os.listdir(base) if os.path.isfile(os.path.join(base, f))]
         top_v = sum(1 for f in top_files if os.path.splitext(f)[1].lower() in VIDEO_EXTS)
@@ -2057,6 +2156,7 @@ class AutoCutStudioApp(tk.Tk):
         idx = active if active in sel else sel[0]
         if 0 <= idx < len(self._date_folders):
             folder = self._date_folders[idx]
+            self._show_mode_for_folder(folder)
             self.timeline.load_folder(folder, self._output_dir_for(folder), self.include_photos.get(), force=force)
             self._schedule_session_save()
 
@@ -2215,6 +2315,7 @@ class AutoCutStudioApp(tk.Tk):
             return
 
         selected_paths = [self._date_folders[i] for i in sel]
+        folder_modes = {p: self._folder_mode(p) for p in selected_paths}
         self._stop_requested = False
         self._running = True
         self.start_btn.configure(state=tk.DISABLED)
@@ -2223,11 +2324,11 @@ class AutoCutStudioApp(tk.Tk):
 
         threading.Thread(
             target=self._worker_run,
-            args=(selected_paths,),
+            args=(selected_paths, folder_modes),
             daemon=True,
         ).start()
 
-    def _worker_run(self, selected_paths):
+    def _worker_run(self, selected_paths, folder_modes=None):
         base_dir = self.target_dir.get().strip()
         chosen_preset = self.style_preset_var.get()
         chosen_intro_style = INTRO_STYLE_PRESETS.get(self.intro_style_var.get(), "classic_frame")
@@ -2244,13 +2345,18 @@ class AutoCutStudioApp(tk.Tk):
                 clip_rotations = load_clip_rotations(folder_path, out_dir)
 
                 self.after(0, self.log, f"\n==========================================")
-                self.after(0, self.log, f"🎬 [{idx}/{len(selected_paths)}] {date_name} 자동 편집 시작")
+                folder_mode = (folder_modes or {}).get(folder_path, self.default_edit_mode.get())
+                self.after(
+                    0,
+                    self.log,
+                    f"🎬 [{idx}/{len(selected_paths)}] {date_name} 자동 편집 시작 (편집 모드: {EDIT_MODE_LABELS.get(folder_mode, folder_mode)})",
+                )
                 self.after(0, self.log, f"==========================================")
 
                 summary = run_autocut_pipeline(
                     date_folder_path=folder_path,
                     output_dir=out_dir,
-                    edit_mode=self.edit_mode.get(),
+                    edit_mode=folder_mode,
                     whisper_model_size=self.whisper_model.get(),
                     denoise_audio=self.denoise_audio.get(),
                     include_scene_captions=self.include_scene_captions.get(),

@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "3.0.1"
+AUTOCUT_VERSION = "3.1.1"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -4278,6 +4278,82 @@ def _has_audio_stream(path: str) -> bool:
 _AAC_ARGS = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
 
 
+def _one_cut_cmd(
+    *,
+    src: str,
+    is_photo: bool,
+    in_s: float,
+    in_t: float,
+    skip: float,
+    pre_vf: str,
+    scale_pad_vf: str,
+    post_vf: str,
+    hud_png: str,
+    bgm_file: str,
+    bgm_ss: float,
+    bgm_vol: float,
+    photo_bgm_af: str,
+    hw_args: List[str],
+    decode_args: List[str],
+    fade_out_v: str,
+    fade_out_a: str,
+    vcodec_args: List[str],
+    tail_vf: str,
+    audio_gain_db: Optional[float],
+    out_path: str,
+) -> List[str]:
+    """ffmpeg command rendering source [in_s, in_s + in_t) to one file, dropping the first `skip` seconds after
+    the source-side filters (used when those filters need every frame from in_s, e.g. vid.stab transforms)."""
+    out_t = in_t - skip
+    if is_photo:
+        cmd = ["ffmpeg", "-y", "-v", "error", "-loop", "1", "-t", f"{in_t:.3f}", "-i", src]
+    else:
+        cmd = ["ffmpeg", "-y", "-v", "error", *hw_args, *decode_args, "-ss", f"{in_s:.3f}", "-t", f"{in_t:.3f}", "-i", src]
+    n_in = 1
+    hud_idx = bgm_idx = null_idx = None
+    if hud_png:
+        cmd += ["-i", hud_png]
+        hud_idx, n_in = n_in, n_in + 1
+    if bgm_file:
+        cmd += ["-stream_loop", "-1", "-ss", f"{bgm_ss:.2f}", "-t", f"{out_t:.3f}", "-i", bgm_file]
+        bgm_idx, n_in = n_in, n_in + 1
+    has_audio = (not is_photo) and _has_audio_stream(src)
+    if not has_audio and not (is_photo and bgm_file):
+        cmd += ["-f", "lavfi", "-t", f"{out_t:.3f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        null_idx, n_in = n_in, n_in + 1
+
+    v_skip = f"trim=start={skip:.3f},setpts=PTS-STARTPTS," if skip > 0 else ""
+    v = f"[0:v]{pre_vf}{v_skip}{scale_pad_vf}{post_vf}"
+    if hud_idx is not None:
+        v += f"[base];[base][{hud_idx}:v]overlay=0:0:format=auto"
+    # tail_vf: final pixel format, plus the SDR -> HLG conversion when the master is HLG
+    v += f"{fade_out_v},{tail_vf}[v]"
+
+    if is_photo and bgm_idx is not None:
+        a = f"[{bgm_idx}:a]{photo_bgm_af}"
+    else:
+        src_a = "[0:a]" if has_audio else f"[{null_idx}:a]"
+        if has_audio and skip > 0:
+            src_a += f"atrim=start={skip:.3f},asetpts=PTS-STARTPTS,"
+        chain = clip_audio_chain(audio_gain_db) if has_audio else "anull"
+        if bgm_idx is not None:
+            a = (
+                f"{src_a}{chain}[va];[{bgm_idx}:a]volume={bgm_vol:.3f},aresample=48000[ba];"
+                f"[va][ba]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1:normalize=0{fade_out_a}"
+            )
+        else:
+            a = f"{src_a}{chain}{fade_out_a}"
+    a += "[a]"
+
+    cmd += ["-filter_complex", f"{v};{a}", "-map", "[v]", "-map", "[a]", *vcodec_args, *_AAC_ARGS]
+    if is_photo:
+        cmd += ["-shortest"]
+    # exact output length: the fps filter can emit one extra frame at the input's end, and one frame per cut
+    # adds up to seconds of subtitle drift over a long edit
+    cmd += ["-t", f"{out_t:.3f}", out_path]
+    return cmd
+
+
 def _build_cut_render_cmd(
     *,
     src: str,
@@ -4302,73 +4378,50 @@ def _build_cut_render_cmd(
     out_handle: str = "",
     tail_vf: str = "format=yuv420p",
     audio_gain_db: Optional[float] = None,
-) -> List[str]:
+    stateful_pre: bool = False,
+) -> List[List[str]]:
     """
-    One ffmpeg command for a cut (video or photo slide). With handle > 0 (video only) it also writes
-    out_handle: the next `handle` seconds of source past the cut's out point, processed by exactly the
-    same graph (color, HDR tone map, rotation, HUD, loudness, BGM), so the next join can dissolve out of
-    moving footage instead of a frozen frame and crossfade the sound.
+    ffmpeg commands for a cut (video or photo slide): [main] or, with handle > 0 (video only), [main, handle].
+    The handle is the next `handle` seconds of source past the cut's out point, processed by the same graph
+    (color, HDR tone map, rotation, HUD, loudness, BGM), so the next join can dissolve out of moving footage
+    instead of a frozen frame and crossfade the sound.
+    It is a separate, short ffmpeg run on purpose: writing it from the same graph through split + trim made
+    ffmpeg queue every frame of the cut in RAM while it waited for the handle output's first frame (~25 MB per
+    4K 10-bit frame -> tens of GB and a stall on cuts of ~20 s and longer).
+    stateful_pre: the source-side filters depend on frame position (vid.stab transforms) — the handle then
+    decodes from the cut's in point and drops the cut part instead of seeking to the out point.
     audio_gain_db: the clip's fixed loudness-match gain (None = loudnorm on this cut alone).
     """
-    total = dur + (handle if not is_photo else 0.0)
-    if is_photo:
-        cmd = ["ffmpeg", "-y", "-v", "error", "-loop", "1", "-t", f"{dur:.3f}", "-i", src]
-    else:
-        cmd = ["ffmpeg", "-y", "-v", "error", *hw_args, *decode_args, "-ss", f"{s:.3f}", "-t", f"{total:.3f}", "-i", src]
-    n_in = 1
-    hud_idx = bgm_idx = null_idx = None
-    if hud_png:
-        cmd += ["-i", hud_png]
-        hud_idx, n_in = n_in, n_in + 1
-    if bgm_file:
-        cmd += ["-stream_loop", "-1", "-ss", f"{bgm_ss:.2f}", "-t", f"{total:.3f}", "-i", bgm_file]
-        bgm_idx, n_in = n_in, n_in + 1
-    has_audio = (not is_photo) and _has_audio_stream(src)
-    if not has_audio and not (is_photo and bgm_file):
-        cmd += ["-f", "lavfi", "-t", f"{total:.3f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
-        null_idx, n_in = n_in, n_in + 1
-
-    split_h = handle > 0 and not is_photo
-    v = f"[0:v]{pre_vf}{scale_pad_vf}{post_vf}"
-    if hud_idx is not None:
-        v += f"[base];[base][{hud_idx}:v]overlay=0:0:format=auto"
-    # tail_vf: final pixel format, plus the SDR -> HLG conversion when the master is HLG
-    v += f"{fade_out_v},{tail_vf}"
-    if split_h:
-        v += (
-            f",split=2[vf1][vf2];[vf1]trim=end={dur:.3f},setpts=PTS-STARTPTS[v];"
-            f"[vf2]trim=start={dur:.3f},setpts=PTS-STARTPTS[vh]"
+    common = dict(
+        src=src,
+        is_photo=is_photo,
+        pre_vf=pre_vf,
+        scale_pad_vf=scale_pad_vf,
+        post_vf=post_vf,
+        hud_png=hud_png,
+        bgm_file=bgm_file,
+        bgm_vol=bgm_vol,
+        photo_bgm_af=photo_bgm_af,
+        hw_args=hw_args,
+        decode_args=decode_args,
+        vcodec_args=vcodec_args,
+        tail_vf=tail_vf,
+        audio_gain_db=audio_gain_db,
+    )
+    cmds = [
+        _one_cut_cmd(
+            **common, in_s=s, in_t=dur, skip=0.0, bgm_ss=bgm_ss, fade_out_v=fade_out_v, fade_out_a=fade_out_a, out_path=out_main
         )
-    else:
-        v += "[v]"
-
-    if is_photo and bgm_idx is not None:
-        a = f"[{bgm_idx}:a]{photo_bgm_af}"
-    else:
-        src_a = "[0:a]" if has_audio else f"[{null_idx}:a]"
-        chain = clip_audio_chain(audio_gain_db) if has_audio else "anull"
-        if bgm_idx is not None:
-            a = (
-                f"{src_a}{chain}[va];[{bgm_idx}:a]volume={bgm_vol:.3f},aresample=48000[ba];"
-                f"[va][ba]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1:normalize=0{fade_out_a}"
-            )
+    ]
+    if handle > 0 and not is_photo and out_handle:
+        if stateful_pre:
+            span = dict(in_s=s, in_t=dur + handle, skip=dur)
         else:
-            a = f"{src_a}{chain}{fade_out_a}"
-    if split_h:
-        a += (
-            f",asplit=2[af1][af2];[af1]atrim=end={dur:.3f},asetpts=PTS-STARTPTS[a];"
-            f"[af2]atrim=start={dur:.3f},asetpts=PTS-STARTPTS[ah]"
+            span = dict(in_s=s + dur, in_t=handle, skip=0.0)
+        cmds.append(
+            _one_cut_cmd(**common, **span, bgm_ss=bgm_ss + dur, fade_out_v="", fade_out_a="", out_path=out_handle)
         )
-    else:
-        a += "[a]"
-
-    cmd += ["-filter_complex", f"{v};{a}", "-map", "[v]", "-map", "[a]", *vcodec_args, *_AAC_ARGS]
-    if is_photo:
-        cmd += ["-shortest"]
-    cmd.append(out_main)
-    if split_h and out_handle:
-        cmd += ["-map", "[vh]", "-map", "[ah]", *vcodec_args, *_AAC_ARGS, out_handle]
-    return cmd
+    return cmds
 
 
 def _join_cut(
@@ -5208,6 +5261,7 @@ def run_autocut_pipeline(
 
             if ctype == "video":
                 src, pre_vf, post_vf, photo_bgm_af = fpath, hdr_head, clip_eq_chain, ""
+                stab_vf = ""
                 if stabilize:
                     if fpath not in stab_device_cache:
                         stab_device_cache[fpath] = stabilization_device_ok(fpath)
@@ -5231,6 +5285,7 @@ def run_autocut_pipeline(
                         else:
                             stab_counts["calm"] += 1
             else:
+                stab_vf = ""
                 # Photo segment: normalize orientation (EXIF + upright check + blurred frame) & play BGM at normal volume (bgm_photo_vol)
                 norm_photo = os.path.join(tmpdir, f"photo_norm_{cut_idx:04d}.jpg")
                 ok_p, _ = prepare_upright_photo_1080p(
@@ -5249,7 +5304,7 @@ def run_autocut_pipeline(
                     f"afade=t=out:st={photo_fade_end:.2f}:d=0.35{fade_out_a},aresample=48000"
                 )
 
-            cmd_raw = _build_cut_render_cmd(
+            cut_cmds = _build_cut_render_cmd(
                 src=src,
                 is_photo=ctype != "video",
                 s=s,
@@ -5272,11 +5327,20 @@ def run_autocut_pipeline(
                 out_handle=handle_seg,
                 tail_vf=tail_vf,
                 audio_gain_db=loudness_map.get(fpath, 0.0) if (loudness_match and ctype == "video") else None,
+                stateful_pre=bool(stab_vf),
             )
-            res = subprocess.run(cmd_raw, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            res = subprocess.run(cut_cmds[0], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if res.returncode != 0:
                 err = res.stderr.decode("utf-8", "ignore").strip().splitlines()[-3:]
                 raise RuntimeError(f"컷 렌더링 실패 ({fname} {s:.1f}s~{e:.1f}s): {' / '.join(err)}")
+            if len(cut_cmds) > 1:
+                # the handle only improves the next join: on failure that join falls back to a still frame
+                res_h = subprocess.run(cut_cmds[1], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                if res_h.returncode != 0:
+                    try:
+                        os.remove(handle_seg)
+                    except OSError:
+                        pass
 
             # Join into the previous segment: dissolve out of its handle / still + audio crossfade
             used, used_td, used_ax = _join_cut(

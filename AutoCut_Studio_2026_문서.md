@@ -103,7 +103,8 @@ flowchart TD
 ### ④-2 상황별 트랜지션 & 오디오 크로스페이드 (v2.5.0)
 ![상황별 트랜지션 미리보기](docs/transitions_preview.png)
 * **실제 영상 겹침 ([`_build_cut_render_cmd`](file:///d:/workspace/autocut/autocut_engine.py), [`_join_cut`](file:///d:/workspace/autocut/autocut_engine.py))**:
-  * 각 컷을 렌더링할 때 아웃 지점 뒤 원본 0.25~0.7초(핸들)를 같은 필터 그래프에서 함께 출력하고, 다음 컷 시작부와 `xfade`로 겹칩니다. 전체 길이는 그대로라 자막 싱크가 유지됩니다. (사진·원본 끝 컷은 마지막 프레임 정지 방식으로 대체)
+  * 각 컷 뒤 원본 0.25~0.7초(핸들)를 같은 필터(색·톤매핑·회전·HUD·음량·BGM)로 렌더링해 다음 컷 시작부와 `xfade`로 겹칩니다. 전체 길이는 그대로라 자막 싱크가 유지됩니다. (사진·원본 끝 컷은 마지막 프레임 정지 방식으로 대체)
+  * **핸들은 별도 ffmpeg 실행 (`_one_cut_cmd`, v3.1.1)**: 예전엔 한 그래프에서 `split` + `trim`으로 본 컷과 핸들을 함께 출력했는데, 핸들 출력의 첫 프레임(컷 끝)이 나올 때까지 ffmpeg가 컷 전체 프레임을 RAM에 쌓아(4K 10-bit 프레임당 약 25MB) 20초 이상 컷에서 수십 GB 후 정지 (실측: 23초 컷에서 53.8GB, 진행률 51.3%에서 멈춤). 이제 본 컷은 `-ss s -t dur`, 핸들은 `-ss s+dur -t handle`로 따로 (최대 RAM 약 3.9GB, 핸들 2.5초). vid.stab이 걸린 컷은 변환이 프레임 순서에 묶여 있어 핸들을 컷 시작부터 디코딩해 `trim=start=dur`로 잘라 씀. 출력에 `-t`를 지정해 컷마다 1프레임씩 늘어 자막이 밀리는 것을 방지.
 * **상황별 선택 ([`plan_transition`](file:///d:/workspace/autocut/autocut_engine.py))**:
   * 점프컷 = 짧은 디졸브/컷, 같은 장면 = 필름 디졸브, 장면 전환(20분 이상·다른 날) = 화이트 딥·라이트 릭·휩 팬(그냥 대화 = 블랙 딥). 프리셋 스타일(빠른 텐션/시네마틱)과 `transition_prob`를 반영합니다.
 * **오디오 크로스페이드**: 영상 컷마다 0.25초 선형 크로스페이드로 '틱' 소리와 뚝 끊김을 없앱니다.
@@ -140,6 +141,7 @@ flowchart TD
 ### ⑦ 스튜디오급 다크 UI & 하드웨어 모니터
 * **깔끔한 3단 카드 레이아웃 ([`AutoCutStudioApp._build_ui`](file:///d:/workspace/autocut/autocut_gui.py#L510-L855))**:
   * **좌측 카드**: 날짜별 폴더 목록, 실시간 미디어 개수 배지, `🔄 개수 새로고침 (F5)`, 사진 포함 옵션
+  * **폴더별 편집 모드 (`folder_edit_modes`, `_show_mode_for_folder`, v3.1.0)**: 편집 모드 라디오는 타임라인에 열린 날짜 폴더의 모드를 보여 주고 바꾸면 그 폴더에만 저장(기본 모드와 같으면 폴더 설정 삭제). 기본 모드는 예전 설정 키 `edit_mode`(`default_edit_mode`)로 저장돼 이전 작업 상태와 호환. 목록 항목에 모드 표시(`✎` = 폴더 전용), `↳ 모든 폴더에 적용` = 기본 모드 변경 + 폴더 설정 초기화. 편집 시작 시 UI 스레드에서 폴더별 모드를 고정해 `_worker_run`에 넘기고 폴더마다 `run_autocut_pipeline(edit_mode=…)`. 작업 상태 JSON의 `folder_edit_modes`({폴더 이름: 모드})에 저장.
   * **중앙 카드**: 편집 모드(일반/하이라이트), 인트로 제목·로고 입력창(글자 겹침 없는 2열 다크 폼), 큼직한 `✔` (v-체크) 커스텀 체크박스 옵션
   * **우측 카드**: 출력 인코딩 사양(`HEVC`, 해상도, FPS, `bps`), 스타일 프리셋 및 유튜브 URL 학습기
   * **하단 상태 줄**: 실시간 **CPU · GPU0(iGPU) · GPU1(NVIDIA, NVENC·VRAM) · NPU 사용률 숫자**([`SystemResourceMonitor`](file:///d:/workspace/autocut/autocut_gui.py) — 작업 관리자와 같은 Windows `GPU Engine` 성능 카운터, GPU 번호도 작업 관리자 순서)를 상태 줄 오른쪽에 표시하고, **사용률 그래프와 실시간 로그는 각각 플로팅 창**(체크박스로 표시/숨김, 창 ✕ = 체크 해제, 위치 저장 — 로그 v2.7.0, 그래프 v2.9.1). 비워진 공간은 위쪽 날짜 폴더 목록이 사용.
