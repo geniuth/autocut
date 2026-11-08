@@ -124,6 +124,8 @@ flowchart TD
 ### ⑤ 출력 인코딩 사양 (HEVC 기본 · 해상도 · 프레임 · bps 화질)
 * **압축 코덱 ([`_build_vcodec_args`](file:///d:/workspace/autocut/autocut_engine.py#L219-L250))**:
   * 고화질·고효율 압축을 위해 **NVIDIA 하드웨어 가속 `HEVC (H.265 - hevc_nvenc, -tag:v hvc1)`**를 기본 코덱으로 사용하며, `H.264 (h264_nvenc)`로도 전환할 수 있습니다.
+  * **SEI 전달 끔 (`_NVENC_NO_PASSTHROUGH_SEI`, v3.1.2)**: 모든 NVENC 인코딩에 `-s12m_tc 0 -a53cc 0`. NVENC는 원본의 SMPTE 12M 타임코드(소니 XAVC S)를 SEI로 복사하는데, 색 태그를 쓰는 `hevc_metadata`/`h264_metadata`가 그 SEI를 해석하지 못해 패킷을 버리고도 ffmpeg는 0으로 종료 → 컷 영상이 비거나 프레임 누락 (실측: 수양개 편집본 366.8초 중 255~319초 영상 없음, 평균 48.8fps). 수정 후 소니 4클립 편집본 59.91fps·끊김 0.
+  * **컷 프레임 수 확인 (`_video_packet_count`, v3.1.2)**: 컷 렌더링 후 영상 패킷 수가 예상(길이×fps)의 90% 미만이면 오류로 중단, 핸들은 50% 미만이면 버리고 정지 프레임 전환.
 * **사용자 지정 해상도 · 프레임 · 비트레이트(`bps`)**:
   * **출력 해상도**: `3840x2160 (4K UHD)`, `2560x1440 (QHD)`, `1920x1080 (FHD, 기본)`, `1280x720 (HD)`
   * **프레임 레이트**: `60 fps` (기본), `30 fps`, `24 fps`

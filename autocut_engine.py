@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "3.1.1"
+AUTOCUT_VERSION = "3.1.2"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -559,6 +559,13 @@ def output_pix_fmt(output_dr: str = "sdr") -> str:
     return "yuv420p10le" if output_dr == "hlg" else "yuv420p"
 
 
+# NVENC copies a source's SMPTE 12M timecode (Sony XAVC S, pro cameras) and A/53 captions into the stream as SEI.
+# The hevc_metadata / h264_metadata bitstream filter that writes our color tags cannot parse that timecode SEI and
+# drops the packet ("Failed to read unit (type 39)") while ffmpeg still exits 0 — the cut ends up with missing
+# frames or no video at all. An edited video has no use for either, so they are never passed on.
+_NVENC_NO_PASSTHROUGH_SEI = ["-s12m_tc", "0", "-a53cc", "0"]
+
+
 def _build_vcodec_args(video_codec: str = "hevc_nvenc", video_bitrate_bps: int = 25000000, output_dr: str = "sdr") -> List[str]:
     codec = (video_codec or "hevc_nvenc").strip().lower()
     if output_dr == "hlg":
@@ -581,6 +588,7 @@ def _build_vcodec_args(video_codec: str = "hevc_nvenc", video_bitrate_bps: int =
             str(int(bps * 1.25)),
             "-bufsize",
             str(int(bps * 2.0)),
+            *_NVENC_NO_PASSTHROUGH_SEI,
             "-bsf:v",
             "hevc_metadata=colour_primaries=9:transfer_characteristics=18:matrix_coefficients=9",
         ]
@@ -609,6 +617,7 @@ def _build_vcodec_args(video_codec: str = "hevc_nvenc", video_bitrate_bps: int =
         str(max_bps),
         "-bufsize",
         str(buf_bps),
+        *_NVENC_NO_PASSTHROUGH_SEI,
         # Output is always an SDR Rec.709 master (HDR clips are tone-mapped), so tag it explicitly.
         # Written into the bitstream VUI: NVENC ignores -color_* output options, and concat -c copy keeps the VUI.
         "-bsf:v",
@@ -4262,6 +4271,19 @@ def _xfade_video_graph(name: str, td: float, pix_fmt: str = "yuv420p") -> str:
 _HAS_AUDIO_CACHE: Dict[str, bool] = {}
 
 
+def _video_packet_count(path: str) -> int:
+    """Number of video packets in a file (container scan, no decoding); 0 when there is no video stream."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        return int(out.split(",")[0]) if out else 0
+    except Exception:
+        return 0
+
+
 def _has_audio_stream(path: str) -> bool:
     if path not in _HAS_AUDIO_CACHE:
         try:
@@ -5333,10 +5355,20 @@ def run_autocut_pipeline(
             if res.returncode != 0:
                 err = res.stderr.decode("utf-8", "ignore").strip().splitlines()[-3:]
                 raise RuntimeError(f"컷 렌더링 실패 ({fname} {s:.1f}s~{e:.1f}s): {' / '.join(err)}")
+            # ffmpeg can exit 0 after a bitstream filter dropped packets: make sure the cut really has its frames
+            # (a cut without video would freeze the picture in the joined edit while the sound runs on)
+            expected = dur * out_fps
+            got = _video_packet_count(raw_seg)
+            if got < expected * 0.9:
+                err = res.stderr.decode("utf-8", "ignore").strip().splitlines()[-2:]
+                raise RuntimeError(
+                    f"컷 렌더링 결과에 영상 프레임이 모자랍니다 ({fname} {s:.1f}s~{e:.1f}s: {got}/{int(expected)}프레임)"
+                    + (f": {' / '.join(err)}" if err else "")
+                )
             if len(cut_cmds) > 1:
                 # the handle only improves the next join: on failure that join falls back to a still frame
                 res_h = subprocess.run(cut_cmds[1], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                if res_h.returncode != 0:
+                if res_h.returncode != 0 or _video_packet_count(handle_seg) < handle * out_fps * 0.5:
                     try:
                         os.remove(handle_seg)
                     except OSError:
