@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "3.3.0"
+AUTOCUT_VERSION = "3.4.0"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -2416,6 +2416,7 @@ def create_vertical_reframe(
     out_mp4: str,
     *,
     start_sec: float,
+    end_sec: float = 0.0,
     shot_starts: List[float],
     hud_band: bool,
     date_text: str,
@@ -2442,6 +2443,9 @@ def create_vertical_reframe(
     if progress_fn:
         progress_fn(96.0, "세로 쇼츠(9:16) 리프레임: 얼굴·피사체 추적 중...")
     times, xs, extents, n_face = _reframe_targets(clean_mp4, start_sec, w / h, stop_check_fn)
+    if end_sec > start_sec:  # stop before the end credits
+        keep = times < (end_sec - start_sec)
+        times, xs, extents = times[keep], xs[keep], extents[keep]
     if not len(xs):
         return False
     path = _reframe_path(times, xs, [t - start_sec for t in shot_starts], extents, cw / w)
@@ -2466,7 +2470,7 @@ def create_vertical_reframe(
         f"[0:v]sendcmd=f={_ff_filter_path(cmd_file)},crop=w={cw}:h={ch}:x={int(x_cmd[0])}:y={band},"
         f"scale={REFRAME_W}:{REFRAME_H}:flags=lanczos"
     )
-    inputs = ["-ss", f"{start_sec:.3f}", "-i", clean_mp4]
+    inputs = ["-ss", f"{start_sec:.3f}"] + (["-t", f"{end_sec - start_sec:.3f}"] if end_sec > start_sec else []) + ["-i", clean_mp4]
     if enable_hud:
         hud_v = os.path.join(workdir, "hud_vertical.png")
         create_hud_overlay_png(hud_v, date_name=date_text, logo_text=logo_text, out_width=REFRAME_W, out_height=REFRAME_H, ui_scale=1.0)
@@ -3387,14 +3391,107 @@ def create_hud_overlay_png(
     overlay.save(hud_png_path, "PNG")
 
 
+def create_lower_third_png(png_path: str, time_str: str, desc: str, out_width: int = 1920, out_height: int = 1080) -> None:
+    """Transparent WxH overlay with a lower-third caption bar (accent line, small time, bold description)."""
+    W, H = int(out_width), int(out_height)
+    k = H / 1080.0
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img, "RGBA")
+    f_time = _load_kr_font(max(12, int(round(24 * k))), bold=True)
+    f_desc = _load_kr_font(max(16, int(round(40 * k))), bold=True)
+    max_w = int(W * 0.62)
+    while draw.textlength(desc, font=f_desc) > max_w and len(desc) > 4:
+        desc = desc[:-2].rstrip() + "…"
+    tw = int(max(draw.textlength(desc, font=f_desc), draw.textlength(time_str, font=f_time)))
+    pad, bar = int(round(22 * k)), max(3, int(round(7 * k)))
+    x0, y1 = int(round(64 * k)), H - int(round(118 * k))
+    box_h = int(round(118 * k))
+    box = [x0, y1 - box_h, x0 + bar + pad * 2 + tw, y1]
+    draw.rounded_rectangle(box, radius=int(round(10 * k)), fill=(14, 18, 30, 170))
+    draw.rectangle([x0, y1 - box_h, x0 + bar, y1], fill=(249, 226, 175, 255))
+    tx = x0 + bar + pad
+    draw.text((tx, y1 - box_h + int(round(14 * k))), time_str, font=f_time, fill=(249, 226, 175, 255))
+    draw.text(
+        (tx, y1 - box_h + int(round(48 * k))), desc, font=f_desc, fill=(255, 255, 255, 255),
+        stroke_width=max(1, int(round(2 * k))), stroke_fill=(10, 14, 24, 220),
+    )
+    img.save(png_path, "PNG")
+
+
+END_CREDITS_SEC = 7.0
+
+
+def create_end_credits_segment(
+    out_mp4: str,
+    lines: List[Tuple[str, str]],
+    *,
+    duration: float = END_CREDITS_SEC,
+    bgm_path: str = "",
+    bgm_ss: float = 0.0,
+    bgm_vol: float = 0.38,
+    out_width: int = 3840,
+    out_height: int = 2160,
+    out_fps: float = 60.0,
+    video_bitrate_bps: int = 25000000,
+    video_codec: str = "hevc_nvenc",
+    output_dr: str = "sdr",
+) -> bool:
+    """
+    End credits that roll from below the frame to above it on black. lines: (kind, text) with kind
+    "title" | "head" | "item" | "gap". The music fades out with the roll.
+    """
+    W, H = int(out_width), int(out_height)
+    k = H / 1080.0
+    fonts = {
+        "title": (_load_kr_font(int(round(64 * k)), bold=True), (255, 255, 255, 255), int(round(96 * k))),
+        "head": (_load_kr_font(int(round(26 * k)), bold=True), (249, 226, 175, 255), int(round(44 * k))),
+        "item": (_load_kr_font(int(round(38 * k)), bold=False), (225, 230, 245, 255), int(round(60 * k))),
+    }
+    total_h = sum(int(round(40 * k)) if kind == "gap" else fonts[kind][2] for kind, _ in lines) + int(round(20 * k))
+    strip = Image.new("RGBA", (W, max(2, total_h + total_h % 2)), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(strip, "RGBA")
+    y = 0
+    for kind, text in lines:
+        if kind == "gap":
+            y += int(round(40 * k))
+            continue
+        font, color, lh = fonts[kind]
+        draw.text(((W - draw.textlength(text, font=font)) / 2, y), text, font=font, fill=color)
+        y += lh
+    strip_png = out_mp4 + "_credits.png"
+    strip.save(strip_png, "PNG")
+    fps_expr = _fps_to_ffmpeg_expr(out_fps)
+    out_hw, out_tail = sdr_to_output_vf(output_dr)
+    cmd = ["ffmpeg", "-y", "-v", "error", *out_hw, "-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:r={fps_expr}:d={duration:.2f}",
+           "-loop", "1", "-t", f"{duration:.2f}", "-i", strip_png]
+    if bgm_path and os.path.isfile(bgm_path):
+        cmd += ["-stream_loop", "-1", "-ss", f"{bgm_ss:.2f}", "-t", f"{duration:.2f}", "-i", bgm_path]
+        a_graph = f"[2:a]volume={bgm_vol:.3f},afade=t=in:st=0:d=0.4,afade=t=out:st={max(0.5, duration - 2.0):.2f}:d=2.0,aresample=48000[a]"
+    else:
+        cmd += ["-f", "lavfi", "-t", f"{duration:.2f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        a_graph = "[2:a]anull[a]"
+    v_graph = f"[0:v][1:v]overlay=x=0:y='H-(H+h)*t/{duration:.2f}':format=auto,format=yuv420p,{out_tail}[v]"
+    cmd += ["-filter_complex", f"{v_graph};{a_graph}", "-map", "[v]", "-map", "[a]",
+            *_build_vcodec_args(video_codec, video_bitrate_bps, output_dr), *_AAC_ARGS, "-t", f"{duration:.2f}", out_mp4]
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        os.remove(strip_png)
+    except OSError:
+        pass
+    return res.returncode == 0 and os.path.exists(out_mp4)
+
+
 def render_intro_frame_by_style(
     base_rgba: Image.Image,
     title_text: str,
     date_name: str,
     logo_text: str,
     intro_style: str = "classic_frame",
+    title_chars: Optional[int] = None,
 ) -> Tuple[Image.Image, str]:
     """
+    title_chars: draw only the first N characters of the title (plus a caret) in the place the full title
+    takes — the layout is always computed from the full title, so typed-out frames line up.
     Render one of 5 distinct intro designs onto base_rgba (W x H RGBA image):
     - classic_frame: 클래식 화이트 프레임 (반투명 중앙 박스 + 이중 테두리)
     - cinematic_bar: 시네마틱 레터박스 (상하 영화관 블랙바 + 와이드 타이틀)
@@ -3417,6 +3514,7 @@ def render_intro_frame_by_style(
     draw = ImageDraw.Draw(overlay, "RGBA")
 
     main_title = title_text.strip() or "우리 가족 여행 기록"
+    drawn_title = main_title if title_chars is None else main_title[: max(0, title_chars)] + "_"
     sub_title = _format_date_korean_dot(date_name)
     date_disp = f"DATE  |  {sub_title}"
     logo_disp = f"★  {logo_text.strip()}" if logo_text.strip() else ""
@@ -3486,7 +3584,7 @@ def render_intro_frame_by_style(
         ty = by0 + int(round(22 * s_fac))
         draw.text(
             (tx + int(round(4 * s_fac)), ty + int(round(5 * s_fac))),
-            main_title,
+            drawn_title,
             font=font_title,
             fill=(0, 0, 0, 120),
             stroke_width=st_w_title,
@@ -3494,7 +3592,7 @@ def render_intro_frame_by_style(
         )
         draw.text(
             (tx, ty),
-            main_title,
+            drawn_title,
             font=font_title,
             fill=(24, 42, 86, 255),
             stroke_width=st_w_title,
@@ -3553,7 +3651,7 @@ def render_intro_frame_by_style(
         ty = by0 + int(round(34 * s_fac))
         draw.text(
             (tx, ty),
-            main_title,
+            drawn_title,
             font=font_title,
             fill=(255, 255, 255, 255),
             stroke_width=st_w,
@@ -3635,7 +3733,7 @@ def render_intro_frame_by_style(
         ty_title = ty_tag + int(round(38 * s_fac))
         draw.text(
             (tx, ty_title),
-            main_title,
+            drawn_title,
             font=font_title,
             fill=(255, 255, 255, 255),
             stroke_width=st_w,
@@ -3698,7 +3796,7 @@ def render_intro_frame_by_style(
         ty = py0 + pill_h + int(round(20 * s_fac))
         draw.text(
             (tx, ty),
-            main_title,
+            drawn_title,
             font=font_title,
             fill=(255, 255, 255, 255),
             stroke_width=st_w,
@@ -3752,7 +3850,7 @@ def render_intro_frame_by_style(
         by_center = H - (border_bot // 2) - (th // 2) - int(round(6 * s_fac))
         draw.text(
             (border_side + int(round(24 * s_fac)), by_center),
-            main_title,
+            drawn_title,
             font=font_title,
             fill=(24, 34, 56, 255),
         )
@@ -3786,8 +3884,10 @@ def create_intro_segment(
     video_codec: str = "hevc_nvenc",
     intro_style: str = "classic_frame",
     output_dr: str = "sdr",
+    typewriter: bool = False,
 ):
     """
+    typewriter: the title is typed out character by character (0.35 s in, done by about half the intro).
     Create a 3-second Intro clip from the Best Shot using the selected intro_style:
     - Supports 5 distinct intro designs (classic_frame, cinematic_bar, magazine_lower, minimal_glass, vlog_stamp) + random
     - Renders 3.0s MP4 with HEVC/H.264, custom resolution/fps/bitrate, and normal-volume calm BGM
@@ -3796,7 +3896,7 @@ def create_intro_segment(
     with Image.open(best_img_path) as raw_im:
         base = ImageOps.exif_transpose(raw_im).convert("RGBA").resize((W, H), Image.Resampling.LANCZOS)
 
-    composed_rgb, _ = render_intro_frame_by_style(
+    composed_rgb, style_id = render_intro_frame_by_style(
         base_rgba=base,
         title_text=title_text,
         date_name=date_name,
@@ -3805,6 +3905,26 @@ def create_intro_segment(
     )
     intro_frame_png = intro_mp4_path + "_frame.png"
     composed_rgb.save(intro_frame_png, "PNG")
+
+    type_list = ""
+    n_chars = len(title_text.strip())
+    if typewriter and n_chars >= 2 and duration >= 2.0:
+        # one still per typed character, played through the concat demuxer
+        start, per_char = 0.35, float(np.clip((duration * 0.5 - 0.35) / n_chars, 0.04, 0.14))
+        type_list = intro_mp4_path + "_type.txt"
+        with open(type_list, "w", encoding="utf-8") as f:
+            f.write("ffconcat version 1.0\n")
+            for k in range(n_chars):
+                frame_k, _ = render_intro_frame_by_style(
+                    base_rgba=base, title_text=title_text, date_name=date_name, logo_text=logo_text,
+                    intro_style=style_id, title_chars=k,
+                )
+                png_k = f"{intro_mp4_path}_type{k:02d}.png"
+                frame_k.save(png_k, "PNG", compress_level=1)
+                f.write(f"file '{os.path.basename(png_k)}'\nduration {start if k == 0 else per_char:.3f}\n")
+            rest = max(0.2, duration - start - per_char * (n_chars - 1))
+            f.write(f"file '{os.path.basename(intro_frame_png)}'\nduration {rest:.3f}\n")
+            f.write(f"file '{os.path.basename(intro_frame_png)}'\n")
 
     fps_expr = _fps_to_ffmpeg_expr(out_fps)
     vcodec_args = _build_vcodec_args(video_codec, video_bitrate_bps, output_dr)
@@ -3885,11 +4005,18 @@ def create_intro_segment(
             "-shortest",
             intro_mp4_path,
         ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if type_list:
+        i = cmd.index("-loop")
+        cmd[i : i + 6] = ["-f", "concat", "-safe", "0", "-i", type_list]
+        cmd[-1:] = ["-t", f"{duration:.2f}", intro_mp4_path]
     try:
-        os.remove(intro_frame_png)
-    except Exception:
-        pass
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    finally:
+        for junk in [intro_frame_png] + glob.glob(glob.escape(intro_mp4_path) + "_type*"):
+            try:
+                os.remove(junk)
+            except OSError:
+                pass
 
 
 def format_srt_time(seconds: float) -> str:
@@ -3988,6 +4115,7 @@ def build_subtitles_for_timeline(
     max_sub_chars: int = 28,
     sub_font_size: int = 52,
     srt_speaker_path: str = "",
+    scene_tags_in_ass: bool = True,
 ) -> Tuple[int, int]:
     """
     Write the full SRT (scene tags + speech), the speech-only SRT and the ASS used for burn-in.
@@ -4029,9 +4157,10 @@ def build_subtitles_for_timeline(
                 if cap_end - cap_start >= 1.4:
                     caption_text = f"[{time_str}] {desc}"
                     srt_entries.append((cap_start, cap_end, caption_text))
-                    ass_events.append(
-                        f"Dialogue: 1,{format_ass_time(cap_start)},{format_ass_time(cap_end)},SceneTag,,0,0,0,,{{\\fad(250,250)}}▶ {time_str} | {desc}"
-                    )
+                    if scene_tags_in_ass:
+                        ass_events.append(
+                            f"Dialogue: 1,{format_ass_time(cap_start)},{format_ass_time(cap_end)},SceneTag,,0,0,0,,{{\\fad(250,250)}}▶ {time_str} | {desc}"
+                        )
         if cur_hm:
             prev_hm = cur_hm
 
@@ -4504,6 +4633,7 @@ def _one_cut_cmd(
     tail_vf: str,
     audio_gain_db: Optional[float],
     out_path: str,
+    lower_third: Optional[Tuple[str, float, float]] = None,
 ) -> List[str]:
     """ffmpeg command rendering source [in_s, in_s + in_t) to one file, dropping the first `skip` seconds after
     the source-side filters (used when those filters need every frame from in_s, e.g. vid.stab transforms)."""
@@ -4525,10 +4655,23 @@ def _one_cut_cmd(
         cmd += ["-f", "lavfi", "-t", f"{out_t:.3f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
         null_idx, n_in = n_in, n_in + 1
 
+    lt_idx = None
+    if lower_third:
+        cmd += ["-loop", "1", "-t", f"{out_t:.3f}", "-i", lower_third[0]]
+        lt_idx, n_in = n_in, n_in + 1
+
     v_skip = f"trim=start={skip:.3f},setpts=PTS-STARTPTS," if skip > 0 else ""
     v = f"[0:v]{pre_vf}{v_skip}{scale_pad_vf}{post_vf}"
     if hud_idx is not None:
         v += f"[base];[base][{hud_idx}:v]overlay=0:0:format=auto"
+    if lt_idx is not None:
+        # lower-third caption: slides are not needed, a quarter-second alpha fade in and out reads cleanly
+        lt_s, lt_e = lower_third[1], lower_third[2]
+        v += (
+            f"[pre_lt];[{lt_idx}:v]format=rgba,fade=t=in:st={lt_s:.2f}:d=0.25:alpha=1,"
+            f"fade=t=out:st={lt_e - 0.25:.2f}:d=0.25:alpha=1[lt];"
+            f"[pre_lt][lt]overlay=0:0:format=auto:enable='between(t,{lt_s:.2f},{lt_e:.2f})'"
+        )
     # tail_vf: final pixel format, plus the SDR -> HLG conversion when the master is HLG
     v += f"{fade_out_v},{tail_vf}[v]"
 
@@ -4582,6 +4725,7 @@ def _build_cut_render_cmd(
     tail_vf: str = "format=yuv420p",
     audio_gain_db: Optional[float] = None,
     stateful_pre: bool = False,
+    lower_third: Optional[Tuple[str, float, float]] = None,
 ) -> List[List[str]]:
     """
     ffmpeg commands for a cut (video or photo slide): [main] or, with handle > 0 (video only), [main, handle].
@@ -4613,7 +4757,8 @@ def _build_cut_render_cmd(
     )
     cmds = [
         _one_cut_cmd(
-            **common, in_s=s, in_t=dur, skip=0.0, bgm_ss=bgm_ss, fade_out_v=fade_out_v, fade_out_a=fade_out_a, out_path=out_main
+            **common, in_s=s, in_t=dur, skip=0.0, bgm_ss=bgm_ss, fade_out_v=fade_out_v, fade_out_a=fade_out_a, out_path=out_main,
+            lower_third=lower_third,
         )
     ]
     if handle > 0 and not is_photo and out_handle:
@@ -4847,6 +4992,9 @@ def run_autocut_pipeline(
     speaker_diarization: bool = True,
     stabilize: bool = False,
     vertical_reframe: bool = False,
+    intro_typewriter: bool = False,
+    lower_third_captions: bool = False,
+    end_credits: bool = False,
     log_fn: Callable[[str], None] = print,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     stop_check_fn: Optional[Callable[[], bool]] = None,
@@ -4865,6 +5013,9 @@ def run_autocut_pipeline(
     speaker_diarization: label who speaks each sentence (speaker SRT + speaker colors in burned subtitles).
     stabilize: vid.stab on shaky hand-held phone cuts (gimbal/action cameras and HDR-in-HLG clips skipped).
     vertical_reframe: also render a 1080x1920 version whose 9:16 window follows faces / the subject.
+    intro_typewriter: the intro title is typed out character by character.
+    lower_third_captions: scene captions ("15:12 | 공항에서…") are drawn into the video as a lower-third bar.
+    end_credits: a rolling credits segment (title, date, cameras, clip counts, logo) after the last cut.
     Models:
       1) Faster-Whisper large-v3-turbo (Speech & VAD)
       2) CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5)
@@ -5297,6 +5448,7 @@ def run_autocut_pipeline(
             intro_sig = _sig(
                 "intro", _file_md5(best_img_path), intro_title, shown_date, logo_text, intro_dur, bgm_file, bgm_photo_vol,
                 out_width, out_height, out_fps, video_bitrate_bps, video_codec, intro_style, out_dr, AUTOCUT_VERSION,
+                intro_typewriter,
             )
             if manifest.get("intro") == intro_sig and _video_packet_count(intro_mp4) >= intro_dur * out_fps * 0.9:
                 log_fn("⏩ 이전에 만든 인트로를 그대로 사용합니다")
@@ -5317,6 +5469,7 @@ def run_autocut_pipeline(
                     video_codec=video_codec,
                     intro_style=intro_style,
                     output_dr=out_dr,
+                    typewriter=intro_typewriter,
                 )
                 manifest["intro"] = intro_sig
                 _save_json_cache(manifest_path, manifest)
@@ -5356,6 +5509,7 @@ def run_autocut_pipeline(
             max_sub_chars=max_sub_chars,
             sub_font_size=sub_font_size,
             srt_speaker_path=srt_speaker if n_speakers >= 2 else "",
+            scene_tags_in_ass=not lower_third_captions,  # already in the picture as lower thirds
         )
         log_fn(f"📝 자막 파일 생성 완료: 전체 자막 {n_all}개 (음성 대화 {n_sp}개) -> {os.path.basename(srt_full)}")
         if n_speakers >= 2 and os.path.exists(srt_speaker):
@@ -5366,6 +5520,22 @@ def run_autocut_pipeline(
             for s, e in clip["kept_intervals"]:
                 if round(e - s, 2) >= 0.8:
                     flat_cuts.append((clip, s, e))
+
+        lower_thirds: Dict[Tuple[int, float], Tuple[str, str]] = {}
+        if lower_third_captions and include_scene_captions:
+            prev_hm_lt = ""
+            for c_i, clip in enumerate(clips_meta):
+                if not clip.get("kept_intervals"):
+                    continue
+                ct_lt = clip.get("creation_time", "")
+                cap = infer_scene_caption(
+                    c_i, clip["file"], ct_lt, prev_hm_lt, clip.get("vision_summary", []), vlm_caption=clip.get("vlm_caption", "")
+                )
+                if cap:
+                    lower_thirds[(id(clip), clip["kept_intervals"][0][0])] = cap
+                if ct_lt and "T" in ct_lt and len(ct_lt) >= 16:
+                    prev_hm_lt = ct_lt[11:16]
+            log_fn(f"🏷️ 장면 캡션을 화면 하단 자막 바(로워 서드)로 표시: {len(lower_thirds)}개 클립")
 
         total_cuts = len(flat_cuts)
         rng = random.Random(42)
@@ -5477,6 +5647,15 @@ def run_autocut_pipeline(
             handle_seg = os.path.join(tmpdir, f"handle_{cut_idx:04d}.mp4")
             kept_tail = os.path.join(resume_dir, f"tail_{cut_idx:04d}.mp4")
 
+            lower_third = None
+            cap = lower_thirds.get((id(clip), s))
+            if cap and min(4.3, dur) - 0.45 >= 1.4:
+                lt_png = os.path.join(tmpdir, f"lower_third_{cut_idx:04d}.png")
+                create_lower_third_png(lt_png, cap[0], cap[1], out_width, out_height)
+                if out_dr == "hlg" and ctype == "video" and detect_dynamic_range(fpath)["range"] != "SDR":
+                    create_hlg_dimmed_png(lt_png, lt_png)  # drawn straight onto HLG pixels, like the HUD
+                lower_third = (lt_png, 0.45, min(4.3, dur))
+
             fade_out_v = ""
             fade_out_a = ""
             if is_last_cut and dur > 1.5:
@@ -5557,6 +5736,7 @@ def run_autocut_pipeline(
                 tail_vf=tail_vf,
                 audio_gain_db=loudness_map.get(fpath, 0.0) if (loudness_match and ctype == "video") else None,
                 stateful_pre=bool(stab_vf),
+                lower_third=lower_third,
             )
             expected = dur * out_fps
 
@@ -5568,6 +5748,7 @@ def run_autocut_pipeline(
                 _file_md5(lut_m.group(1).replace("\\:", ":")) if lut_m else "",
                 _file_md5(src) if ctype != "video" else _file_cache_key(fpath),
                 _file_md5(os.path.join(tmpdir, f"stab_{cut_idx:04d}.trf")) if stab_vf else "",
+                _file_md5(lower_third[0]) if lower_third else "",
             ]
             render_sig = _sig(_strip_workdir(cut_cmds, tmpdir), aux, out_fps, None if is_last_cut else plans[cut_idx], AUTOCUT_VERSION)
             join_sig = _sig(render_sig, prev_render_sig, trans_in, td_in, vcodec_args, out_pix, AUDIO_XFADE_SEC)
@@ -5684,6 +5865,35 @@ def run_autocut_pipeline(
                 + (f" · HLG 원본(10-bit) 제외 {stab_counts['skipped_hdr']}컷" if stab_counts["skipped_hdr"] else "")
             )
 
+        credits_dur = 0.0
+        if end_credits and total_cuts:
+            if progress_fn:
+                progress_fn(89.0, "엔딩 크레딧 만드는 중...")
+            devices: Dict[str, int] = defaultdict(int)
+            for c in clips_meta:
+                if c.get("kept_intervals") and os.path.exists(c.get("path", "")):
+                    devices[probe_media_item(c["path"]).get("device", "") or "기타 기기"] += 1
+            n_vid = sum(1 for c in clips_meta if c.get("type", "video") == "video" and c.get("kept_intervals"))
+            n_pho = sum(1 for c in clips_meta if c.get("type") == "photo")
+            lines = [("title", intro_title.strip() or date_name), ("item", _format_date_korean_dot(shown_date)), ("gap", "")]
+            lines += [("head", "촬영")] + [("item", f"{d}  ·  {n}개") for d, n in sorted(devices.items(), key=lambda kv: -kv[1])[:6]]
+            lines += [("gap", ""), ("head", "구성"), ("item", f"영상 {n_vid}개" + (f"  ·  사진 {n_pho}장" if n_pho else ""))]
+            lines += [("item", f"원본 {total_orig_sec / 60:.0f}분  →  편집 {(total_edit_sec + intro_dur) / 60:.0f}분")]
+            if logo_text.strip():
+                lines += [("gap", ""), ("head", "만든 사람"), ("item", logo_text.strip())]
+            lines += [("gap", ""), ("head", "편집"), ("item", "AutoCut Studio 2026")]
+            credits_mp4 = os.path.join(resume_dir, "seg_9999_credits.mp4")
+            if create_end_credits_segment(
+                credits_mp4, lines, bgm_path=bgm_file if (bgm_file and os.path.isfile(bgm_file)) else "",
+                bgm_ss=round(bgm_cursor % 145.0, 2), bgm_vol=bgm_photo_vol, out_width=out_width, out_height=out_height,
+                out_fps=out_fps, video_bitrate_bps=video_bitrate_bps, video_codec=video_codec, output_dr=out_dr,
+            ):
+                seg_files.append(credits_mp4)
+                credits_dur = END_CREDITS_SEC
+                log_fn(f"🎞️ 엔딩 크레딧 {END_CREDITS_SEC:.0f}초 추가 (제목·날짜·촬영 기기 {len(devices)}종·구성·로고)")
+            else:
+                log_fn("⚠️ 엔딩 크레딧을 만들지 못해 건너뜁니다")
+
         concat_txt = os.path.join(tmpdir, "concat_list.txt")
         with open(concat_txt, "w", encoding="utf-8") as f:
             for sf in seg_files:
@@ -5715,7 +5925,7 @@ def run_autocut_pipeline(
         # a stretch without video and silently dropped frames — were only found by watching the result
         if progress_fn:
             progress_fn(92.0, "완성본 검사 중 (프레임 누락·화면 멈춤·길이·음량)...")
-        expected_total = intro_dur + sum(round(ce - cs, 2) for _c, cs, ce in flat_cuts)
+        expected_total = intro_dur + sum(round(ce - cs, 2) for _c, cs, ce in flat_cuts) + credits_dur
         check = verify_output_video(clean_mp4, expected_total, out_fps)
         analysis_summary["verify"] = check
         lufs_txt = f" · 음량 {check['lufs']:.1f} LUFS" if check.get("lufs") is not None else ""
@@ -5731,7 +5941,7 @@ def run_autocut_pipeline(
         if not burn_subtitles:
             log_fn(
                 f"ℹ️ 자막은 SRT로만 저장했습니다 ({os.path.basename(srt_full)}, {os.path.basename(srt_speech)}) — "
-                "영상에 직접 입히려면 '자막 입힌 완성본도 만들기'를 켜세요 (전체 재인코딩)"
+                "영상에 직접 입히려면 '자막 입힌 완성본도 만들기'를 켜세요 (자막이 나오는 컷만 다시 인코딩)"
             )
 
         if burn_subtitles:
@@ -5742,6 +5952,7 @@ def run_autocut_pipeline(
             # filter and back); cuts without one are copied as they are. The old way re-encoded the whole edit.
             spans = _ass_event_spans(ass_tmp)
             seg_durs = ([intro_dur] if enable_intro else []) + [round(ce - cs, 2) for _c, cs, ce in flat_cuts]
+            seg_durs += [credits_dur] if credits_dur else []
             sub_list, t_cursor, n_burned = [], 0.0, 0
             for seg_i, (seg, seg_d) in enumerate(zip(seg_files, seg_durs)):
                 if any(a < t_cursor + seg_d and b > t_cursor for a, b in spans):
@@ -5797,6 +6008,7 @@ def run_autocut_pipeline(
                 clean_mp4,
                 vertical_mp4,
                 start_sec=start_v,
+                end_sec=(expected_total - credits_dur) if credits_dur else 0.0,
                 shot_starts=shot_starts,
                 hud_band=enable_hud,
                 date_text=shown_date,

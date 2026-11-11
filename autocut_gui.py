@@ -589,6 +589,10 @@ class AutoCutStudioApp(tk.Tk):
         self.speaker_diarization = tk.BooleanVar(value=False)
         self.stabilize = tk.BooleanVar(value=False)
         self.vertical_reframe = tk.BooleanVar(value=False)
+        # Text effects: typed-out intro title, scene captions as lower thirds, rolling end credits
+        self.intro_typewriter = tk.BooleanVar(value=False)
+        self.lower_third_captions = tk.BooleanVar(value=False)
+        self.end_credits = tk.BooleanVar(value=False)
         self.include_scene_captions = tk.BooleanVar(value=True)
         # Burning subtitles re-encodes the whole finished video once more, so it is opt-in (SRTs are always written)
         self.burn_subtitles = tk.BooleanVar(value=False)
@@ -949,6 +953,9 @@ class AutoCutStudioApp(tk.Tk):
             "speaker_diarization": self.speaker_diarization,
             "stabilize": self.stabilize,
             "vertical_reframe": self.vertical_reframe,
+            "intro_typewriter": self.intro_typewriter,
+            "lower_third_captions": self.lower_third_captions,
+            "end_credits": self.end_credits,
             "include_scene_captions": self.include_scene_captions,
             "burn_subtitles": self.burn_subtitles,
             "show_log_window": self.show_log_window,
@@ -1567,6 +1574,17 @@ class AutoCutStudioApp(tk.Tk):
         d_border.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Label(date_row, text=" 비우면 촬영 날짜 자동 · 예: 2025.09.20", style="Desc.TLabel").pack(side=tk.LEFT, padx=(6, 0))
 
+        # Text effects in one compact row (the timeline below needs the height)
+        text_fx = ttk.Frame(col2, style="Card.TFrame")
+        text_fx.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(text_fx, text="텍스트 효과", style="FormLabel.TLabel").pack(side=tk.LEFT, padx=(0, 14))
+        for lbl_txt, var_obj in (
+            ("제목 타이핑", self.intro_typewriter),
+            ("장면 캡션 하단 바", self.lower_third_captions),
+            ("엔딩 크레딧", self.end_credits),
+        ):
+            self._make_vcheck(text_fx, lbl_txt, var_obj, bg=bg_card).pack(side=tk.LEFT, padx=(0, 12))
+
         tk.Frame(col2, bg="#313244", height=1).pack(fill=tk.X, pady=(2, 6))
 
         # Large V-Checkboxes with clean spacing
@@ -1577,11 +1595,13 @@ class AutoCutStudioApp(tk.Tk):
             ("잔잔한 무료 배경음악(BGM) 자동 볼륨 조절 믹싱", self.enable_bgm),
             ("주행·바람 노이즈 제거 및 AI 한국어 음성 자막", self.denoise_audio),
             ("HDR 영상 자동 색 균형 (AI 미학 점수로 밝기·검정·채도 보정)", self.auto_color_balance),
-            ("자막 입힌 완성본도 만들기 (전체 재인코딩 · SRT는 항상 생성)", self.burn_subtitles),
-            ("편집 완료 후 결과 폴더 자동으로 열기", self.auto_open_folder_on_done),
         ]
         for lbl_txt, var_obj in chk_list:
             self._make_vcheck(col2, lbl_txt, var_obj, bg=bg_card).pack(anchor="w", pady=2)
+        last_row = ttk.Frame(col2, style="Card.TFrame")  # two short options share a row
+        last_row.pack(fill=tk.X, pady=2)
+        self._make_vcheck(last_row, "자막 입힌 완성본도 만들기 (SRT는 항상 생성)", self.burn_subtitles, bg=bg_card).pack(side=tk.LEFT)
+        self._make_vcheck(last_row, "완료 후 결과 폴더 열기", self.auto_open_folder_on_done, bg=bg_card).pack(side=tk.LEFT, padx=(16, 0))
 
         # =====================================================================
         # COLUMN 3: 출력 인코딩 화질(4K 60fps HEVC 25Mbps) · DJI D-Log · 유튜브 스타일
@@ -2389,6 +2409,9 @@ class AutoCutStudioApp(tk.Tk):
                     speaker_diarization=self.speaker_diarization.get(),
                     stabilize=self.stabilize.get(),
                     vertical_reframe=self.vertical_reframe.get(),
+                    intro_typewriter=self.intro_typewriter.get(),
+                    lower_third_captions=self.lower_third_captions.get(),
+                    end_credits=self.end_credits.get(),
                     log_fn=lambda m: self.after(0, self.log, m),
                     progress_fn=lambda p, s: self.after(0, self.update_progress, p, s),
                     stop_check_fn=lambda: self._stop_requested,

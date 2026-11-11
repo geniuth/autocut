@@ -109,6 +109,11 @@ flowchart TD
   * 점프컷 = 짧은 디졸브/컷, 같은 장면 = 필름 디졸브, 장면 전환(20분 이상·다른 날) = 화이트 딥·라이트 릭·휩 팬(그냥 대화 = 블랙 딥). 프리셋 스타일(빠른 텐션/시네마틱)과 `transition_prob`를 반영합니다.
 * **오디오 크로스페이드**: 영상 컷마다 0.25초 선형 크로스페이드로 '틱' 소리와 뚝 끊김을 없앱니다.
 
+### ④-2b 텍스트 효과 (v3.4.0)
+* **제목 타이핑 (`create_intro_segment(typewriter=True)`, `render_intro_frame_by_style(title_chars=k)`)**: 레이아웃은 항상 전체 제목으로 계산하고 앞 k글자 + `_`만 그린 정지 화면을 글자 수만큼 만들어 ffconcat(이미지 + duration)으로 재생. 글자당 0.04~0.14초, 인트로 절반 안에 완성.
+* **장면 캡션 하단 바 (`create_lower_third_png`, `_one_cut_cmd(lower_third=…)`)**: 자막 생성과 같은 규칙(`infer_scene_caption`, 클립 첫 컷, 0.45~4.3초, 1.4초 이상)으로 컷별 투명 PNG를 만들어 알파 페이드 0.25초로 overlay. HLG 마스터의 HDR 컷은 HUD처럼 75%로 어둡게. 이 옵션이 켜지면 ASS의 `SceneTag` 이벤트는 생략(SRT에는 유지).
+* **엔딩 크레딧 (`create_end_credits_segment`, `END_CREDITS_SEC = 7`)**: 가운데 정렬 텍스트 띠(RGBA)를 검은 배경 위에서 `overlay y=H-(H+h)*t/D`로 굴림. 이어하기 캐시에 `seg_9999_credits.mp4`로 넣어 병합·자막본·완성본 검사 길이에 반영, 세로 리프레임은 `end_sec`로 크레딧 앞에서 끝냄.
+
 ### ④-3 마무리 보정 (v3.0.0 · FilmCraft 아이디어를 ffmpeg + numpy로 재구현)
 * **기기 간 색 맞춤 ([`ensure_color_match`](file:///d:/workspace/autocut/autocut_engine.py), [`write_color_match_lut`](file:///d:/workspace/autocut/autocut_engine.py))**:
   * 측정: 키프레임 6장을 시청 화면 기준(SDR은 그대로·D-Log 복원 후, HDR은 `_ac_render`로 libplacebo 톤매핑 + 자동 색 균형 후)으로 뽑아 96×54 Oklab으로 변환 → 어두운(`smoothstep(0.55,0.15,L)`)·중간·밝은(`smoothstep(0.45,0.85,L)`) 영역별 평균 a/b와 전체 채도. 피부 픽셀(Oklab 색상 20°~75°)은 가중치 0.2.
