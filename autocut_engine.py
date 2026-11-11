@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "3.1.2"
+AUTOCUT_VERSION = "3.2.0"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -4271,6 +4271,166 @@ def _xfade_video_graph(name: str, td: float, pix_fmt: str = "yuv420p") -> str:
 _HAS_AUDIO_CACHE: Dict[str, bool] = {}
 
 
+FFMPEG_STALL_SEC = 180.0  # an ffmpeg that neither uses CPU nor grows its output for this long is hung
+
+
+class FfmpegStalled(RuntimeError):
+    pass
+
+
+def _run_ffmpeg_watched(
+    cmd: List[str],
+    watch_paths: Tuple[str, ...] = (),
+    stop_check_fn: Optional[Callable[[], bool]] = None,
+    cwd: Optional[str] = None,
+) -> Tuple[int, str]:
+    """
+    Run ffmpeg and return (exit code, stderr text). Unlike subprocess.run it notices a hung process (no CPU
+    time and no output growth for FFMPEG_STALL_SEC -> killed, FfmpegStalled) and honours the stop button
+    while the process runs (killed, RuntimeError).
+    """
+    import time
+
+    with tempfile.TemporaryFile() as err_f:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err_f, cwd=cwd)
+        ps = None
+        try:
+            import psutil
+
+            ps = psutil.Process(proc.pid)
+        except Exception:
+            ps = None
+        last_state, last_change = None, time.time()
+        try:
+            while proc.poll() is None:
+                time.sleep(0.5)
+                if stop_check_fn and stop_check_fn():
+                    raise RuntimeError("사용자에 의해 작업이 중단되었습니다.")
+                state = [os.path.getsize(w) if os.path.exists(w) else -1 for w in watch_paths]
+                if ps is not None:
+                    try:
+                        ct = ps.cpu_times()
+                        state.append(round(ct.user + ct.system, 1))
+                    except Exception:
+                        pass
+                now = time.time()
+                if state != last_state:
+                    last_state, last_change = state, now
+                elif now - last_change > FFMPEG_STALL_SEC:
+                    raise FfmpegStalled(f"ffmpeg가 {int(FFMPEG_STALL_SEC)}초 동안 진행되지 않아 중단했습니다")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        err_f.seek(0)
+        return proc.returncode, err_f.read().decode("utf-8", "ignore")
+
+
+def _run_ffmpeg_retry_stall(cmd, watch_paths=(), stop_check_fn=None, cwd=None, log_fn=print, what="") -> Tuple[int, str]:
+    """_run_ffmpeg_watched, started once more if the first run hung."""
+    try:
+        return _run_ffmpeg_watched(cmd, watch_paths, stop_check_fn, cwd)
+    except FfmpegStalled as ex:
+        log_fn(f"  ⚠️ {what}: {ex} -> 한 번 더 시도합니다")
+    try:
+        return _run_ffmpeg_watched(cmd, watch_paths, stop_check_fn, cwd)
+    except FfmpegStalled as ex:
+        raise RuntimeError(f"{what}: 다시 시도해도 {ex}") from None
+
+
+RESUME_DIR_NAME = "_이어하기_캐시"
+RESUME_VERSION = 1
+
+
+def _sig(*parts) -> str:
+    import hashlib
+
+    return hashlib.md5(json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _file_md5(path: str) -> str:
+    import hashlib
+
+    try:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def _strip_workdir(cmds: List[List[str]], workdir: str) -> List[List[str]]:
+    """Commands with the per-run temp folder replaced by a placeholder, so they compare equal across runs."""
+    fwd = workdir.replace("\\", "/")
+    variants = (workdir, fwd, fwd.replace(":", "\\:"))
+
+    def norm(a: str) -> str:
+        for v in variants:
+            a = a.replace(v, "<WORK>")
+        return a
+
+    return [[norm(str(a)) for a in c] for c in cmds]
+
+
+def verify_output_video(path: str, expected_sec: float, out_fps: float) -> Dict:
+    """
+    Check a finished edit without decoding the picture: missing video (timestamp gaps), dropped frames
+    (effective frame rate), wrong length, audio/video length mismatch; plus the integrated loudness.
+    Returns {"ok", "problems": [text], "duration", "fps", "lufs"}.
+    """
+    res: Dict = {"ok": False, "problems": [], "duration": 0.0, "fps": 0.0, "lufs": None}
+    try:
+        raw = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=600,
+        ).stdout.split()
+        pts = np.sort(np.array([float(x.strip(",")) for x in raw if x.strip(",") not in ("", "N/A")]))
+        a_dur = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=duration", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip().strip(",")
+    except Exception as ex:
+        res["problems"].append(f"검사 실패: {ex}")
+        return res
+    if len(pts) < 2:
+        res["problems"].append("영상 프레임이 없습니다")
+        return res
+    span = float(pts[-1] - pts[0]) + 1.0 / out_fps
+    res["duration"] = round(span, 2)
+    res["fps"] = round(len(pts) / span, 2)
+    gaps = np.where(np.diff(pts) > 0.5)[0]
+    for g in gaps[:5]:
+        t = float(pts[g])
+        res["problems"].append(f"{int(t // 60)}분 {int(t % 60):02d}초부터 {pts[g + 1] - pts[g]:.1f}초 동안 영상이 없습니다(화면 멈춤)")
+    if len(gaps) > 5:
+        res["problems"].append(f"그 밖에 영상이 없는 구간 {len(gaps) - 5}곳")
+    if res["fps"] < out_fps * 0.95 and not len(gaps):
+        res["problems"].append(f"프레임이 빠져 있습니다 (평균 {res['fps']:.1f}fps, 설정 {out_fps:g}fps)")
+    if expected_sec > 0 and abs(span - expected_sec) > max(1.0, expected_sec * 0.01):
+        res["problems"].append(f"길이가 예상과 다릅니다 ({span:.1f}초, 예상 {expected_sec:.1f}초)")
+    try:
+        if a_dur and abs(float(a_dur) - span) > 0.5:
+            res["problems"].append(f"소리와 영상 길이가 다릅니다 (소리 {float(a_dur):.1f}초, 영상 {span:.1f}초)")
+        elif not a_dur:
+            res["problems"].append("소리가 없습니다")
+    except ValueError:
+        pass
+    try:
+        err = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", path, "-map", "0:a:0", "-vn", "-af", "ebur128=framelog=quiet", "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900,
+        ).stderr.decode("utf-8", "ignore")
+        found = re.findall(r"I:\s+(-?[\d.]+) LUFS", err)
+        if found:
+            res["lufs"] = float(found[-1])
+    except Exception:
+        pass
+    res["ok"] = not res["problems"]
+    return res
+
+
 def _video_packet_count(path: str) -> int:
     """Number of video packets in a file (container scan, no decoding); 0 when there is no video stream."""
     try:
@@ -4456,6 +4616,7 @@ def _join_cut(
     td: float,
     vcodec_args: List[str],
     pix_fmt: str = "yuv420p",
+    stop_check_fn: Optional[Callable[[], bool]] = None,
 ) -> Tuple[str, float, float]:
     """
     Blend the previous cut's tail into raw_seg over raw_seg's first seconds (the timeline length is
@@ -4482,8 +4643,11 @@ def _join_cut(
     cmd += ["-map", "[v]", *vcodec_args] if use_v else ["-map", "1:v", "-c:v", "copy"]
     cmd += ["-map", "[a]", *_AAC_ARGS] if use_a else ["-map", "1:a?", "-c:a", "copy"]
     cmd.append(seg_out)
-    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    if res.returncode != 0 or not os.path.exists(seg_out):
+    try:
+        rc, _err = _run_ffmpeg_watched(cmd, (seg_out,), stop_check_fn)
+    except FfmpegStalled:
+        rc = -1
+    if rc != 0 or not os.path.exists(seg_out):
         shutil.copyfile(raw_seg, seg_out)
         return "none", 0.0, 0.0
     return (trans if use_v else "none"), (td if use_v else 0.0), (ax if use_a else 0.0)
@@ -5011,6 +5175,17 @@ def run_autocut_pipeline(
 
         # Step 2: Best Shot Intro (3.0s) & Top-Left Date / Top-Right Logo HUD Overlay
         seg_files = []
+        # Finished cuts are kept next to the results until the edit completes, so a run that was stopped,
+        # crashed or hung continues from the first cut that is missing or whose settings changed
+        resume_dir = os.path.join(output_dir, RESUME_DIR_NAME)
+        os.makedirs(resume_dir, exist_ok=True)
+        manifest_path = os.path.join(resume_dir, "manifest.json")
+        manifest = _load_json_cache(manifest_path)
+        if manifest.get("v") != RESUME_VERSION:
+            manifest = {"v": RESUME_VERSION, "intro": "", "cuts": {}}
+        reused_cuts = 0
+        resume_announced = False
+        prev_render_sig = ""
         intro_dur = 3.0 if enable_intro else 0.0
         bgm_cursor = 0.0
 
@@ -5097,27 +5272,37 @@ def run_autocut_pipeline(
             # Release CLIP / VLM VRAM before heavy 4K 60fps HEVC NVENC rendering
             release_aesthetic_vlm_engine()
 
-            intro_mp4 = os.path.join(tmpdir, "seg_0000_intro.mp4")
-            create_intro_segment(
-                best_img_path=best_img_path,
-                intro_mp4_path=intro_mp4,
-                title_text=intro_title,
-                date_name=shown_date,
-                logo_text=logo_text,
-                duration=intro_dur,
-                bgm_path=bgm_file,
-                bgm_photo_vol=bgm_photo_vol,
-                out_width=out_width,
-                out_height=out_height,
-                out_fps=out_fps,
-                video_bitrate_bps=video_bitrate_bps,
-                video_codec=video_codec,
-                intro_style=intro_style,
-                output_dr=out_dr,
+            intro_mp4 = os.path.join(resume_dir, "seg_0000_intro.mp4")
+            intro_sig = _sig(
+                "intro", _file_md5(best_img_path), intro_title, shown_date, logo_text, intro_dur, bgm_file, bgm_photo_vol,
+                out_width, out_height, out_fps, video_bitrate_bps, video_codec, intro_style, out_dr, AUTOCUT_VERSION,
             )
+            if manifest.get("intro") == intro_sig and _video_packet_count(intro_mp4) >= intro_dur * out_fps * 0.9:
+                log_fn("⏩ 이전에 만든 인트로를 그대로 사용합니다")
+            else:
+                create_intro_segment(
+                    best_img_path=best_img_path,
+                    intro_mp4_path=intro_mp4,
+                    title_text=intro_title,
+                    date_name=shown_date,
+                    logo_text=logo_text,
+                    duration=intro_dur,
+                    bgm_path=bgm_file,
+                    bgm_photo_vol=bgm_photo_vol,
+                    out_width=out_width,
+                    out_height=out_height,
+                    out_fps=out_fps,
+                    video_bitrate_bps=video_bitrate_bps,
+                    video_codec=video_codec,
+                    intro_style=intro_style,
+                    output_dr=out_dr,
+                )
+                manifest["intro"] = intro_sig
+                _save_json_cache(manifest_path, manifest)
+                log_fn(f"✨ 3초 인트로 생성 완료 (제목: '{intro_title}', 스타일: {intro_style}, 정방향 베스트 샷 적용)")
+            prev_render_sig = intro_sig
             bgm_cursor = intro_dur
             seg_files.append(intro_mp4)
-            log_fn(f"✨ 3초 인트로 생성 완료 (제목: '{intro_title}', 스타일: {intro_style}, 정방향 베스트 샷 적용)")
 
             if enable_transitions:
                 tail_path = os.path.join(tmpdir, "tail_0000.mp4")
@@ -5267,8 +5452,9 @@ def run_autocut_pipeline(
                 )
 
             raw_seg = os.path.join(tmpdir, f"raw_{cut_idx:04d}.mp4")
-            seg_out = os.path.join(tmpdir, f"seg_{cut_idx:04d}.mp4")
+            seg_out = os.path.join(resume_dir, f"seg_{cut_idx:04d}.mp4")
             handle_seg = os.path.join(tmpdir, f"handle_{cut_idx:04d}.mp4")
+            kept_tail = os.path.join(resume_dir, f"tail_{cut_idx:04d}.mp4")
 
             fade_out_v = ""
             fade_out_a = ""
@@ -5351,24 +5537,61 @@ def run_autocut_pipeline(
                 audio_gain_db=loudness_map.get(fpath, 0.0) if (loudness_match and ctype == "video") else None,
                 stateful_pre=bool(stab_vf),
             )
-            res = subprocess.run(cut_cmds[0], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            if res.returncode != 0:
-                err = res.stderr.decode("utf-8", "ignore").strip().splitlines()[-3:]
+            expected = dur * out_fps
+
+            # Resume: everything that shapes this cut (its commands, the files they read, the source, how it is
+            # joined to the previous cut and left for the next) -> one signature; same signature = same result
+            lut_m = re.search(r"lut3d=file='(.+?)'", post_vf)
+            aux = [
+                _file_md5(clip_hud) if (enable_hud and os.path.exists(clip_hud)) else "",
+                _file_md5(lut_m.group(1).replace("\\:", ":")) if lut_m else "",
+                _file_md5(src) if ctype != "video" else _file_cache_key(fpath),
+                _file_md5(os.path.join(tmpdir, f"stab_{cut_idx:04d}.trf")) if stab_vf else "",
+            ]
+            render_sig = _sig(_strip_workdir(cut_cmds, tmpdir), aux, out_fps, None if is_last_cut else plans[cut_idx], AUTOCUT_VERSION)
+            join_sig = _sig(render_sig, prev_render_sig, trans_in, td_in, vcodec_args, out_pix, AUDIO_XFADE_SEC)
+            prev_render_sig = render_sig
+            done = manifest["cuts"].get(str(cut_idx))
+            if (
+                done
+                and done.get("sig") == join_sig
+                and _video_packet_count(seg_out) >= expected * 0.9
+                and (not done.get("tail") or os.path.exists(kept_tail))
+            ):
+                used_counts[TRANSITION_LABELS_KO.get(done.get("used", "none"), done.get("used", "none"))] += 1
+                prev_tail_mp4, prev_tail_dur, prev_tail_has_audio = None, 0.0, False
+                if done.get("tail"):
+                    prev_tail_mp4, prev_tail_dur, prev_tail_has_audio = kept_tail, float(done["tail_dur"]), bool(done["tail_audio"])
+                seg_files.append(seg_out)
+                reused_cuts += 1
+                continue
+            if reused_cuts and not resume_announced:
+                log_fn(f"⏩ 이어서 편집: 이전에 완성된 컷 {reused_cuts}개를 그대로 쓰고 {cut_idx}번째 컷부터 렌더링합니다")
+                resume_announced = True
+            manifest["cuts"].pop(str(cut_idx), None)
+
+            rc, err_txt = _run_ffmpeg_retry_stall(
+                cut_cmds[0], (raw_seg,), stop_check_fn, log_fn=log_fn, what=f"컷 렌더링 ({fname} {s:.1f}s~{e:.1f}s)"
+            )
+            if rc != 0:
+                err = err_txt.strip().splitlines()[-3:]
                 raise RuntimeError(f"컷 렌더링 실패 ({fname} {s:.1f}s~{e:.1f}s): {' / '.join(err)}")
             # ffmpeg can exit 0 after a bitstream filter dropped packets: make sure the cut really has its frames
             # (a cut without video would freeze the picture in the joined edit while the sound runs on)
-            expected = dur * out_fps
             got = _video_packet_count(raw_seg)
             if got < expected * 0.9:
-                err = res.stderr.decode("utf-8", "ignore").strip().splitlines()[-2:]
+                err = err_txt.strip().splitlines()[-2:]
                 raise RuntimeError(
                     f"컷 렌더링 결과에 영상 프레임이 모자랍니다 ({fname} {s:.1f}s~{e:.1f}s: {got}/{int(expected)}프레임)"
                     + (f": {' / '.join(err)}" if err else "")
                 )
             if len(cut_cmds) > 1:
                 # the handle only improves the next join: on failure that join falls back to a still frame
-                res_h = subprocess.run(cut_cmds[1], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                if res_h.returncode != 0 or _video_packet_count(handle_seg) < handle * out_fps * 0.5:
+                try:
+                    rc_h, _ = _run_ffmpeg_watched(cut_cmds[1], (handle_seg,), stop_check_fn)
+                except FfmpegStalled:
+                    rc_h = -1
+                if rc_h != 0 or _video_packet_count(handle_seg) < handle * out_fps * 0.5:
                     try:
                         os.remove(handle_seg)
                     except OSError:
@@ -5385,6 +5608,7 @@ def run_autocut_pipeline(
                 td_in,
                 vcodec_args,
                 pix_fmt=out_pix,
+                stop_check_fn=stop_check_fn,
             )
             used_counts[TRANSITION_LABELS_KO.get(used, used)] += 1
 
@@ -5409,9 +5633,23 @@ def run_autocut_pipeline(
                 os.remove(raw_seg)
             except Exception:
                 pass
+            if prev_tail_mp4:
+                # the tail the next cut dissolves out of is kept too, or a resumed run could not join onto this cut
+                shutil.move(prev_tail_mp4, kept_tail)
+                prev_tail_mp4 = kept_tail
+            manifest["cuts"][str(cut_idx)] = {
+                "sig": join_sig,
+                "used": used,
+                "tail": bool(prev_tail_mp4),
+                "tail_dur": prev_tail_dur,
+                "tail_audio": prev_tail_has_audio,
+            }
+            _save_json_cache(manifest_path, manifest)
 
             seg_files.append(seg_out)
 
+        if reused_cuts and not resume_announced:
+            log_fn(f"⏩ 이어서 편집: 이전에 완성된 컷 {reused_cuts}개를 모두 그대로 사용합니다")
         if total_cuts:
             log_fn(
                 "🎬 트랜지션 적용 완료 (실제 영상 겹침 디졸브 + 오디오 크로스페이드): "
@@ -5428,7 +5666,7 @@ def run_autocut_pipeline(
         concat_txt = os.path.join(tmpdir, "concat_list.txt")
         with open(concat_txt, "w", encoding="utf-8") as f:
             for sf in seg_files:
-                f.write(f"file '{sf.replace(chr(92), '/')}'\n")
+                f.write("file '" + sf.replace(chr(92), "/").replace("'", "'\\''") + "'\n")
 
         clean_mp4 = os.path.join(output_dir, f"{date_name}_무자막_필모라용.mp4")
         subbed_mp4 = os.path.join(output_dir, f"{date_name}_자막포함_완성본.mp4")
@@ -5442,29 +5680,33 @@ def run_autocut_pipeline(
         # run (program closed, crash) never leaves a broken video under the real name
         clean_part = clean_mp4[:-4] + ".partial.mp4"
         subbed_part = subbed_mp4[:-4] + ".partial.mp4"
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-v",
-                "error",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                concat_txt,
-                "-c",
-                "copy",
-                *tag_args,
-                "-movflags",
-                "+faststart",
-                clean_part,
-            ],
-            check=True,
+        rc, err_txt = _run_ffmpeg_retry_stall(
+            ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", concat_txt, "-c", "copy", *tag_args,
+             "-movflags", "+faststart", clean_part],
+            (clean_part,), stop_check_fn, log_fn=log_fn, what="클립 병합",
         )
+        if rc != 0:
+            raise RuntimeError(f"클립 병합 실패: {' / '.join(err_txt.strip().splitlines()[-3:])}")
         os.replace(clean_part, clean_mp4)
         log_fn(f"✅ 필모라 연동용 무자막 영상 저장 완료: {clean_mp4}")
+
+        # Final check of the finished file (timestamps only, a few seconds): the two failures seen in practice —
+        # a stretch without video and silently dropped frames — were only found by watching the result
+        if progress_fn:
+            progress_fn(92.0, "완성본 검사 중 (프레임 누락·화면 멈춤·길이·음량)...")
+        expected_total = intro_dur + sum(round(ce - cs, 2) for _c, cs, ce in flat_cuts)
+        check = verify_output_video(clean_mp4, expected_total, out_fps)
+        analysis_summary["verify"] = check
+        lufs_txt = f" · 음량 {check['lufs']:.1f} LUFS" if check.get("lufs") is not None else ""
+        if check["ok"]:
+            log_fn(
+                f"🔎 완성본 검사 정상: {int(check['duration'] // 60)}분 {int(check['duration'] % 60):02d}초 · "
+                f"{check['fps']:.2f}fps · 영상이 빠진 구간 없음{lufs_txt}"
+            )
+        else:
+            log_fn("⚠️ 완성본 검사에서 문제를 찾았습니다:")
+            for prob in check["problems"]:
+                log_fn(f"   • {prob}")
         if not burn_subtitles:
             log_fn(
                 f"ℹ️ 자막은 SRT로만 저장했습니다 ({os.path.basename(srt_full)}, {os.path.basename(srt_speech)}) — "
@@ -5475,28 +5717,13 @@ def run_autocut_pipeline(
             if progress_fn:
                 progress_fn(94.0, "자막 하드코딩 완성본 MP4 렌더링 중...")
             log_fn(f"🎬 자막 입힌 완성형 MP4 렌더링 중 ({codec_label}, {video_bitrate_bps:,} bps)...")
-            subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-v",
-                    "error",
-                    "-hwaccel",
-                    "auto",
-                    "-i",
-                    clean_mp4,
-                    "-vf",
-                    "ass=subtitles.ass",
-                    *vcodec_args,
-                    "-c:a",
-                    "copy",
-                    "-movflags",
-                    "+faststart",
-                    subbed_part,
-                ],
-                cwd=tmpdir,
-                check=True,
+            rc, err_txt = _run_ffmpeg_retry_stall(
+                ["ffmpeg", "-y", "-v", "error", "-hwaccel", "auto", "-i", clean_mp4, "-vf", "ass=subtitles.ass", *vcodec_args,
+                 "-c:a", "copy", "-movflags", "+faststart", subbed_part],
+                (subbed_part,), stop_check_fn, cwd=tmpdir, log_fn=log_fn, what="자막 입히기",
             )
+            if rc != 0:
+                raise RuntimeError(f"자막 입히기 실패: {' / '.join(err_txt.strip().splitlines()[-3:])}")
             os.replace(subbed_part, subbed_mp4)
             log_fn(f"✅ 자막 포함 완성본 영상 저장 완료: {subbed_mp4}")
 
@@ -5532,6 +5759,9 @@ def run_autocut_pipeline(
 
         if not export_filmora_clean and burn_subtitles and os.path.exists(clean_mp4):
             os.remove(clean_mp4)
+
+        # The edit is complete: the kept cuts are no longer needed (they are as large as the result)
+        shutil.rmtree(resume_dir, ignore_errors=True)
 
         final_edit_sec = total_edit_sec + intro_dur
         if progress_fn:
