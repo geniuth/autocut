@@ -12,6 +12,7 @@
 | [`autocut_gui.py`](file:///d:/workspace/autocut/autocut_gui.py) | **메인 데스크톱 GUI 애플리케이션** (`1920x1080` 풀HD 다크 스튜디오 테마, 프리미어 스타일 스플래시 화면, 3단 카드형 UI, 실시간 CPU/GPU/VRAM 모니터 그래프, 유튜브 URL 학습기) |
 | [`autocut_engine.py`](file:///d:/workspace/autocut/autocut_engine.py) | **핵심 AI 편집 엔진** (날짜별 분류, 메타데이터 시간순 정렬, OpenCV 비전/모션 스코어링, Faster-Whisper 한국어 STT, 베스트 샷 인트로 생성, 동적 BGM 더킹, HDR→SDR 톤매핑, 상황별 트랜지션·오디오 크로스페이드, FFmpeg HEVC NVENC 렌더링) |
 | [`autocut_timeline.py`](file:///d:/workspace/autocut/autocut_timeline.py) | **프리미어식 하단 타임라인** (썸네일 클립 배치, 드래그 순서 변경, 기기 시간 보정, 클립 회전, `편집결과_<날짜>/<날짜>_타임라인순서.json` 저장) |
+| [`tests/test_autocut.py`](file:///d:/workspace/autocut/tests/test_autocut.py) | **회귀 테스트** (unittest, 합성 영상): 단위 20개 + `AUTOCUT_E2E=1`일 때 전체 파이프라인 3개 — 긴 컷 멈춤, SEI 전달, 멈춤 감지, 완성본 검사, 이어서 편집, 컷 수정·미리보기 |
 | `autocut_session.json` (자동 생성, git 제외) | 마지막 작업 상태(설정·선택 폴더) — 다음 실행 때 자동 복원 |
 | `assets/autocut_icon.ico` / `.png` | 시네마 카메라 프로그램 아이콘 (창·작업 표시줄·스플래시) |
 | `assets/face_detection_yunet_2023mar.onnx` | 세로 쇼츠 리프레임용 얼굴 검출 모델 (OpenCV Zoo YuNet, MIT 라이선스, 230KB) |
