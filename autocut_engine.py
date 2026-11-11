@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "3.4.0"
+AUTOCUT_VERSION = "3.5.0"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -4610,6 +4610,74 @@ def _has_audio_stream(path: str) -> bool:
 _AAC_ARGS = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
 
 
+AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma")
+BGM_PAUSE_BOOST = 2.5  # BGM level in pauses relative to its level under speech
+BGM_PAUSE_MAX = 0.20
+BGM_RAMP_SEC = 0.6
+
+
+def bgm_duck_expr(speech: List[Tuple[float, float]], quiet: float, total: float) -> str:
+    """
+    volume expression for the BGM under a video cut: `quiet` while someone speaks (0.3 s of margin), rising over
+    BGM_RAMP_SEC to the pause level where nobody does. speech: (start, end) seconds on the cut's own clock.
+    Pauses shorter than 1.5 s stay ducked, so the music does not pump between sentences.
+    """
+    loud = min(BGM_PAUSE_MAX, quiet * BGM_PAUSE_BOOST)
+    spans: List[List[float]] = []
+    for a, b in sorted((max(0.0, a - 0.3), min(total, b + 0.3)) for a, b in speech if b > 0 and a < total):
+        if spans and a - spans[-1][1] < 1.5:
+            spans[-1][1] = max(spans[-1][1], b)
+        else:
+            spans.append([a, b])
+    if not spans or loud <= quiet:
+        return f"{loud if not spans else quiet:.4f}"
+    spans = spans[:12]
+    near = "0"
+    for a, b in spans:
+        near = f"max({near},clip(1-max(max({a:.2f}-t,t-{b:.2f}),0)/{BGM_RAMP_SEC},0,1))"
+    return f"{loud:.4f}-{loud - quiet:.4f}*{near}"
+
+
+def prepare_bgm_track(path: str, workdir: str, log_fn: Callable[[str], None] = print) -> Tuple[str, float]:
+    """
+    (audio file, loop length in seconds) for the edit's background music. A folder becomes one playlist file:
+    its tracks in name order, each levelled to the same loudness and crossfaded into the next.
+    """
+    def length(f: str) -> float:
+        try:
+            return float(subprocess.check_output(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", f], stderr=subprocess.DEVNULL
+            ).decode().strip() or 0)
+        except Exception:
+            return 0.0
+
+    if os.path.isdir(path):
+        tracks = sorted(os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith(AUDIO_EXTS))
+        tracks = [t for t in tracks if length(t) > 8.0]
+        if not tracks:
+            return "", 0.0
+        if len(tracks) == 1:
+            return tracks[0], max(1.0, length(tracks[0]) - 1.0)
+        out = os.path.join(workdir, "bgm_playlist.wav")
+        cmd = ["ffmpeg", "-y", "-v", "error"]
+        for t in tracks:
+            cmd += ["-i", t]
+        graph = "".join(f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo,loudnorm=I=-18:TP=-2:LRA=11[n{i}];" for i in range(len(tracks)))
+        prev = "[n0]"
+        for i in range(1, len(tracks)):
+            graph += f"{prev}[n{i}]acrossfade=d=3:c1=tri:c2=tri[x{i}];"
+            prev = f"[x{i}]"
+        cmd += ["-filter_complex", graph.rstrip(";"), "-map", prev, "-ar", "48000", "-ac", "2", out]
+        if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0 or not os.path.exists(out):
+            log_fn("⚠️ 배경음악 폴더의 곡들을 잇지 못해 첫 곡만 사용합니다")
+            return tracks[0], max(1.0, length(tracks[0]) - 1.0)
+        log_fn(f"🎵 배경음악 재생 목록: {len(tracks)}곡을 이름순으로 이어 붙임 (곡 사이 3초 크로스페이드, 음량 통일, 총 {length(out) / 60:.1f}분)")
+        return out, max(1.0, length(out) - 1.0)
+    if os.path.isfile(path):
+        return path, max(1.0, length(path) - 1.0)
+    return "", 0.0
+
+
 def _one_cut_cmd(
     *,
     src: str,
@@ -4634,6 +4702,7 @@ def _one_cut_cmd(
     audio_gain_db: Optional[float],
     out_path: str,
     lower_third: Optional[Tuple[str, float, float]] = None,
+    bgm_speech: Optional[List[Tuple[float, float]]] = None,
 ) -> List[str]:
     """ffmpeg command rendering source [in_s, in_s + in_t) to one file, dropping the first `skip` seconds after
     the source-side filters (used when those filters need every frame from in_s, e.g. vid.stab transforms)."""
@@ -4683,8 +4752,14 @@ def _one_cut_cmd(
             src_a += f"atrim=start={skip:.3f},asetpts=PTS-STARTPTS,"
         chain = clip_audio_chain(audio_gain_db) if has_audio else "anull"
         if bgm_idx is not None:
+            # bgm_speech given: the music sits at bgm_vol under speech and comes up in the pauses
+            bgm_level = (
+                f"asetpts=PTS-STARTPTS,volume=eval=frame:volume='{bgm_duck_expr(bgm_speech, bgm_vol, out_t)}'"
+                if bgm_speech is not None
+                else f"volume={bgm_vol:.3f}"
+            )
             a = (
-                f"{src_a}{chain}[va];[{bgm_idx}:a]volume={bgm_vol:.3f},aresample=48000[ba];"
+                f"{src_a}{chain}[va];[{bgm_idx}:a]{bgm_level},aresample=48000[ba];"
                 f"[va][ba]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1:normalize=0{fade_out_a}"
             )
         else:
@@ -4726,6 +4801,7 @@ def _build_cut_render_cmd(
     audio_gain_db: Optional[float] = None,
     stateful_pre: bool = False,
     lower_third: Optional[Tuple[str, float, float]] = None,
+    bgm_speech: Optional[List[Tuple[float, float]]] = None,
 ) -> List[List[str]]:
     """
     ffmpeg commands for a cut (video or photo slide): [main] or, with handle > 0 (video only), [main, handle].
@@ -4758,7 +4834,7 @@ def _build_cut_render_cmd(
     cmds = [
         _one_cut_cmd(
             **common, in_s=s, in_t=dur, skip=0.0, bgm_ss=bgm_ss, fade_out_v=fade_out_v, fade_out_a=fade_out_a, out_path=out_main,
-            lower_third=lower_third,
+            lower_third=lower_third, bgm_speech=bgm_speech,
         )
     ]
     if handle > 0 and not is_photo and out_handle:
@@ -4767,7 +4843,10 @@ def _build_cut_render_cmd(
         else:
             span = dict(in_s=s + dur, in_t=handle, skip=0.0)
         cmds.append(
-            _one_cut_cmd(**common, **span, bgm_ss=bgm_ss + dur, fade_out_v="", fade_out_a="", out_path=out_handle)
+            _one_cut_cmd(
+                **common, **span, bgm_ss=bgm_ss + dur, fade_out_v="", fade_out_a="", out_path=out_handle,
+                bgm_speech=None if bgm_speech is None else [(a - dur, b - dur) for a, b in bgm_speech],
+            )
         )
     return cmds
 
@@ -4995,6 +5074,7 @@ def run_autocut_pipeline(
     intro_typewriter: bool = False,
     lower_third_captions: bool = False,
     end_credits: bool = False,
+    bgm_speech_ducking: bool = True,
     log_fn: Callable[[str], None] = print,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     stop_check_fn: Optional[Callable[[], bool]] = None,
@@ -5016,6 +5096,8 @@ def run_autocut_pipeline(
     intro_typewriter: the intro title is typed out character by character.
     lower_third_captions: scene captions ("15:12 | 공항에서…") are drawn into the video as a lower-third bar.
     end_credits: a rolling credits segment (title, date, cameras, clip counts, logo) after the last cut.
+    bgm_speech_ducking: BGM stays at bgm_video_vol under speech and rises (x2.5, max 20%) in pauses.
+    custom_bgm_path: an audio file, or a folder of tracks played in name order as one playlist.
     Models:
       1) Faster-Whisper large-v3-turbo (Speech & VAD)
       2) CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5)
@@ -5072,8 +5154,8 @@ def run_autocut_pipeline(
 
     bgm_file = ""
     if enable_bgm:
-        if custom_bgm_path and os.path.isfile(custom_bgm_path):
-            bgm_file = custom_bgm_path
+        if custom_bgm_path and (os.path.isfile(custom_bgm_path) or os.path.isdir(custom_bgm_path)):
+            bgm_file = custom_bgm_path  # a folder is turned into one playlist file once the work folder exists
         else:
             bgm_file = ensure_calm_bgm_file()
         log_fn(
@@ -5346,6 +5428,12 @@ def run_autocut_pipeline(
             )
 
         # Step 2: Best Shot Intro (3.0s) & Top-Left Date / Top-Right Logo HUD Overlay
+        bgm_loop = 145.0  # the built-in track loops cleanly here
+        if bgm_file and bgm_file == custom_bgm_path:
+            bgm_file, bgm_loop = prepare_bgm_track(custom_bgm_path, tmpdir, log_fn=log_fn)
+            if not bgm_file:
+                log_fn("⚠️ 지정한 배경음악을 읽을 수 없어 기본 배경음악을 사용합니다")
+                bgm_file, bgm_loop = ensure_calm_bgm_file(), 145.0
         seg_files = []
         # Finished cuts are kept next to the results until the edit completes, so a run that was stopped,
         # crashed or hung continues from the first cut that is missing or whose settings changed
@@ -5663,7 +5751,7 @@ def run_autocut_pipeline(
                 fade_out_v = f",fade=t=out:st={st_fade:.2f}:d=1.20:color=black"
                 fade_out_a = f",afade=t=out:st={st_fade:.2f}:d=1.20"
 
-            bgm_ss = round(bgm_cursor % 145.0, 2)
+            bgm_ss = round(bgm_cursor % bgm_loop, 2)
             bgm_cursor += dur
             has_bgm = bool(bgm_file and os.path.isfile(bgm_file))
 
@@ -5737,6 +5825,11 @@ def run_autocut_pipeline(
                 audio_gain_db=loudness_map.get(fpath, 0.0) if (loudness_match and ctype == "video") else None,
                 stateful_pre=bool(stab_vf),
                 lower_third=lower_third,
+                bgm_speech=(
+                    [(sp["start"] - s, sp["end"] - s) for sp in clip.get("speech") or []]
+                    if (bgm_speech_ducking and ctype == "video")
+                    else None
+                ),
             )
             expected = dur * out_fps
 
@@ -5885,7 +5978,7 @@ def run_autocut_pipeline(
             credits_mp4 = os.path.join(resume_dir, "seg_9999_credits.mp4")
             if create_end_credits_segment(
                 credits_mp4, lines, bgm_path=bgm_file if (bgm_file and os.path.isfile(bgm_file)) else "",
-                bgm_ss=round(bgm_cursor % 145.0, 2), bgm_vol=bgm_photo_vol, out_width=out_width, out_height=out_height,
+                bgm_ss=round(bgm_cursor % bgm_loop, 2), bgm_vol=bgm_photo_vol, out_width=out_width, out_height=out_height,
                 out_fps=out_fps, video_bitrate_bps=video_bitrate_bps, video_codec=video_codec, output_dr=out_dr,
             ):
                 seg_files.append(credits_mp4)

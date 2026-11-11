@@ -100,6 +100,10 @@ flowchart TD
 
 ---
 
+### ④-1b 말소리 기준 BGM 더킹 · 재생 목록 (v3.5.0)
+* **`bgm_duck_expr`**: 컷 안의 Whisper 말소리 구간(±0.3초, 1.5초 미만 간격은 병합, 최대 12개)으로 `volume=eval=frame` 식 생성 — 말하는 동안 `bgm_video_vol`(6%), 쉬는 구간은 ×2.5(최대 20%)까지 0.6초 램프. 핸들은 같은 구간을 컷 길이만큼 옮겨 써서 크로스페이드에서 이어짐. 실측(무음 영상 + BGM): 쉼 0.150 / 말 0.060 / 쉼 0.150.
+* **`prepare_bgm_track`**: `custom_bgm_path`가 폴더면 오디오 파일(8초 이상)을 이름순으로 `loudnorm(-18 LUFS)` 후 `acrossfade 3초`로 이어 임시 폴더에 재생 목록 WAV 생성, 반복 길이는 실제 길이 − 1초(기본 곡은 145초). GUI 메뉴 `🎵 배경음악`.
+
 ### ④-2 상황별 트랜지션 & 오디오 크로스페이드 (v2.5.0)
 ![상황별 트랜지션 미리보기](docs/transitions_preview.png)
 * **실제 영상 겹침 ([`_build_cut_render_cmd`](file:///d:/workspace/autocut/autocut_engine.py), [`_join_cut`](file:///d:/workspace/autocut/autocut_engine.py))**:

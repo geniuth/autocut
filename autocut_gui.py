@@ -827,7 +827,41 @@ class AutoCutStudioApp(tk.Tk):
         style_menu.add_command(label="🔍 로컬 레퍼런스 영상으로 스타일 학습...", command=self.browse_reference_video)
         menubar.add_cascade(label="🎨 편집 스타일 프리셋(S)", menu=style_menu)
 
+        # 3. 배경음악: 기본 곡 / 내 음악 파일 / 여러 곡이 든 폴더(이름순 재생 목록)
+        bgm_menu = tk.Menu(menubar, tearoff=0, font=("맑은 고딕", 10))
+        bgm_menu.add_command(label="🎵 음악 파일 선택...", command=self.choose_bgm_file)
+        bgm_menu.add_command(label="📁 음악 폴더 선택 (여러 곡을 이름순으로 이어서 재생)...", command=self.choose_bgm_folder)
+        bgm_menu.add_command(label="↺ 기본 배경음악으로 되돌리기", command=lambda: self._set_bgm(""))
+        bgm_menu.add_separator()
+        bgm_menu.add_command(label="현재 배경음악 확인", command=lambda: self._set_bgm(self.custom_bgm_path.get(), announce_only=True))
+        menubar.add_cascade(label="🎵 배경음악(B)", menu=bgm_menu)
+
         self.config(menu=menubar)
+
+    def _set_bgm(self, path: str, announce_only: bool = False):
+        if not announce_only:
+            self.custom_bgm_path.set(path)
+        if not path:
+            msg = "🎵 배경음악: 기본 제공 곡 (잔잔한 피아노)"
+        elif os.path.isdir(path):
+            msg = f"🎵 배경음악: 폴더의 곡들을 이름순으로 이어서 재생 — {path}"
+        else:
+            msg = f"🎵 배경음악: {path}"
+        self.log(msg)
+        self.status_var.set(msg)
+
+    def choose_bgm_file(self):
+        fp = filedialog.askopenfilename(
+            title="배경음악 파일 선택",
+            filetypes=[("음악 파일", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.opus *.wma"), ("모든 파일", "*.*")],
+        )
+        if fp:
+            self._set_bgm(fp)
+
+    def choose_bgm_folder(self):
+        d = filedialog.askdirectory(title="배경음악 폴더 선택 (여러 곡을 이름순으로 이어서 재생)")
+        if d:
+            self._set_bgm(d)
 
     def _select_preset_from_menu(self, preset_name: str):
         self.style_preset_var.set(preset_name)
