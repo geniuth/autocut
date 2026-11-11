@@ -93,6 +93,10 @@ from autocut_engine import (
     remove_work_dirs,
     cleanup_stale_work_dirs,
     ACTIVE_WORK_DIRS,
+    planned_cuts_for_folder,
+    load_cut_overrides,
+    save_cut_overrides,
+    normalize_cut_intervals,
 )
 
 # Before anything is spawned (nvidia-smi monitor, ffprobe, renders): children die with this process
@@ -862,6 +866,146 @@ class AutoCutStudioApp(tk.Tk):
         d = filedialog.askdirectory(title="배경음악 폴더 선택 (여러 곡을 이름순으로 이어서 재생)")
         if d:
             self._set_bgm(d)
+
+    # ── Cut editor: what the AI kept of one clip, editable ───────────────────
+    def open_cut_editor(self, item: dict):
+        folder = self.timeline.folder
+        if not folder:
+            return
+        date_name = os.path.basename(folder)
+        out_dir = self._output_dir_for(folder)
+        ratio = _parse_edit_ratio(self.max_edit_ratio_var.get())
+        plan = planned_cuts_for_folder(out_dir, date_name, ratio).get(item["file"])
+        if plan is None:
+            messagebox.showinfo(
+                "컷 수정",
+                "이 폴더는 아직 분석되지 않았습니다.\n[빠른 미리보기] 또는 [자동 편집 시작]을 한 번 실행하면 AI가 고른 구간을 보고 고칠 수 있습니다.",
+                parent=self,
+            )
+            return
+        overrides = load_cut_overrides(out_dir, date_name)
+        edited = item["file"] in overrides
+        intervals = overrides[item["file"]] if edited else plan["auto"]
+        dur = plan["duration"]
+
+        dlg = tk.Toplevel(self)
+        dlg.title(f"컷 수정 — {item['file']}")
+        dlg.configure(bg="#1e1e2e")
+        dlg.transient(self)
+        ff = "맑은 고딕"
+        tk.Label(
+            dlg, text=f"✂ {item['file']}  ·  길이 {dur:.1f}초", font=(ff, 12, "bold"), fg="#f9e2af", bg="#1e1e2e"
+        ).pack(anchor="w", padx=16, pady=(14, 2))
+        info_var = tk.StringVar()
+        tk.Label(dlg, textvariable=info_var, font=(ff, 9), fg="#a6adc8", bg="#1e1e2e", justify=tk.LEFT).pack(anchor="w", padx=16)
+        rows_box = tk.Frame(dlg, bg="#1e1e2e")
+        rows_box.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
+        rows = []
+
+        def speech_in(a: float, b: float) -> str:
+            txt = " ".join(sp["text"] for sp in plan["speech"] if sp["end"] > a and sp["start"] < b)
+            return (txt[:46] + "…") if len(txt) > 47 else txt
+
+        def refresh_info(*_):
+            total = 0.0
+            for r in rows:
+                try:
+                    a, b = float(r["s"].get()), float(r["e"].get())
+                except ValueError:
+                    continue
+                if r["on"].get() and b > a:
+                    total += b - a
+                r["say"].set(speech_in(a, b) or "(말소리 없음)")
+            state = "직접 수정한 구간" if edited else "AI가 고른 구간 (편집 길이 상한 적용 후)"
+            info_var.set(f"{state}  ·  사용 {total:.1f}초 / {dur:.1f}초   —   체크를 끄면 그 구간을 빼고, 시작·끝(초)을 고쳐 늘리거나 줄입니다")
+
+        def add_row(a: float, b: float, on: bool = True):
+            fr = tk.Frame(rows_box, bg="#1e1e2e")
+            fr.pack(fill=tk.X, pady=2)
+            r = {"on": tk.BooleanVar(value=on), "s": tk.StringVar(value=f"{a:.1f}"), "e": tk.StringVar(value=f"{b:.1f}"), "say": tk.StringVar()}
+            self._make_vcheck(fr, "", r["on"], bg="#1e1e2e").pack(side=tk.LEFT)
+            for key in ("s", "e"):
+                bd, _ent = self._make_dark_entry(fr, r[key], width=7)
+                bd.pack(side=tk.LEFT, padx=(4, 0))
+                if key == "s":
+                    tk.Label(fr, text="~", fg="#cdd6f4", bg="#1e1e2e", font=(ff, 10)).pack(side=tk.LEFT, padx=(4, 0))
+                r[key].trace_add("write", refresh_info)
+            tk.Label(fr, text="초", fg="#a6adc8", bg="#1e1e2e", font=(ff, 9)).pack(side=tk.LEFT, padx=(4, 8))
+            ttk.Button(fr, text="▶ 보기", width=7, command=lambda: self._play_range(item["path"], r)).pack(side=tk.LEFT)
+            tk.Label(fr, textvariable=r["say"], fg="#a6e3a1", bg="#1e1e2e", font=(ff, 9), anchor="w").pack(side=tk.LEFT, padx=(10, 0))
+            r["on"].trace_add("write", refresh_info)
+            rows.append(r)
+            refresh_info()
+
+        for a, b in intervals:
+            add_row(a, b)
+        if not intervals:
+            tk.Label(rows_box, text="이 클립은 지금 편집에서 빠져 있습니다. [구간 추가]로 넣을 수 있습니다.", fg="#f38ba8", bg="#1e1e2e", font=(ff, 10)).pack(anchor="w")
+        refresh_info()
+
+        def collect():
+            out = []
+            for r in rows:
+                if not r["on"].get():
+                    continue
+                try:
+                    out.append([float(r["s"].get()), float(r["e"].get())])
+                except ValueError:
+                    messagebox.showerror("컷 수정", "시작·끝 시각은 숫자(초)로 적어 주세요.", parent=dlg)
+                    return None
+            return normalize_cut_intervals(out, dur)
+
+        def save():
+            cuts = collect()
+            if cuts is None:
+                return
+            ov = load_cut_overrides(out_dir, date_name)
+            if cuts == normalize_cut_intervals(plan["auto"], dur):
+                ov.pop(item["file"], None)
+            else:
+                ov[item["file"]] = cuts
+            save_cut_overrides(out_dir, date_name, ov)
+            used = sum(b - a for a, b in cuts)
+            self.log(
+                f"✂️ [{item['file']}] 컷 수정 저장: {len(cuts)}개 구간 · {used:.1f}초"
+                + ("" if item["file"] in ov else " (AI 선택과 같아 수정 기록 없음)")
+            )
+            dlg.destroy()
+
+        def reset():
+            ov = load_cut_overrides(out_dir, date_name)
+            ov.pop(item["file"], None)
+            save_cut_overrides(out_dir, date_name, ov)
+            self.log(f"✂️ [{item['file']}] 컷 수정을 지우고 AI 선택으로 되돌렸습니다")
+            dlg.destroy()
+
+        btns = tk.Frame(dlg, bg="#1e1e2e")
+        btns.pack(fill=tk.X, padx=16, pady=(4, 14))
+        ttk.Button(btns, text="＋ 구간 추가", command=lambda: add_row(0.0, min(dur, 5.0))).pack(side=tk.LEFT)
+        ttk.Button(btns, text="↺ AI 선택으로 되돌리기", command=reset).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="취소", command=dlg.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="저장", style="Accent.TButton", command=save).pack(side=tk.RIGHT, padx=(0, 8))
+        dlg.update_idletasks()
+        dlg.geometry(f"+{self.winfo_rootx() + 120}+{self.winfo_rooty() + 120}")
+        self._apply_crisp_window_icon(dlg)
+        return dlg
+
+    def _play_range(self, path: str, row: dict):
+        """Play one interval of a source clip in a small ffplay window."""
+        try:
+            a, b = float(row["s"].get()), float(row["e"].get())
+        except ValueError:
+            return
+        if b <= a:
+            return
+        try:
+            subprocess.Popen(
+                ["ffplay", "-hide_banner", "-loglevel", "error", "-autoexit", "-ss", f"{a:.2f}", "-t", f"{b - a:.2f}", "-x", "960",
+                 "-window_title", f"{os.path.basename(path)} {a:.1f}~{b:.1f}초", path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            messagebox.showinfo("미리 보기", "ffplay를 찾을 수 없습니다 (FFmpeg full build에 포함).", parent=self)
 
     def _select_preset_from_menu(self, preset_name: str):
         self.style_preset_var.set(preset_name)
@@ -1868,6 +2012,7 @@ class AutoCutStudioApp(tk.Tk):
         # ── Premiere-style clip timeline (just above the footer) ─────────────
         self.timeline = TimelinePanel(main, log_fn=self.log, bg=bg_card, font_family=f_family)
         self.timeline.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
+        self.timeline.on_edit_cuts = self.open_cut_editor
         self.include_photos.trace_add("write", lambda *_: self._sync_timeline(force=True))
         self.show_log_window.trace_add("write", lambda *_: self._apply_log_window_visibility())
         self.show_hw_graph.trace_add("write", lambda *_: self._apply_graph_window_visibility())
@@ -1902,6 +2047,9 @@ class AutoCutStudioApp(tk.Tk):
             command=self.start_auto_edit,
         )
         self.start_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        # Same edit at 720p30: a few minutes to check the cuts, order and sound before the full-quality render
+        self.preview_btn = ttk.Button(btn_frame, text="⚡ 빠른 미리보기(720p)", command=lambda: self.start_auto_edit(preview=True))
+        self.preview_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         self.stop_btn = ttk.Button(btn_frame, text="⏹ 중단", command=self.request_stop, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 8))
@@ -2114,7 +2262,20 @@ class AutoCutStudioApp(tk.Tk):
 
     def update_progress(self, pct: float, status_msg: str):
         self.progress_var.set(pct)
-        self.status_var.set(f"[{pct:5.1f}%] {status_msg}")
+        # Remaining time from the progress rate of the last ~2 minutes (the stages run at very different speeds,
+        # so elapsed / percent would be far off right after a cached analysis)
+        now = time.time()
+        samples = getattr(self, "_eta_samples", [])
+        if samples and pct < samples[-1][1]:
+            samples = []  # next folder started
+        samples.append((now, pct))
+        samples = [sm for sm in samples if now - sm[0] <= 120.0]
+        self._eta_samples = samples
+        eta = ""
+        if 0.0 < pct < 100.0 and now - samples[0][0] >= 20.0 and pct - samples[0][1] > 0.2:
+            remain = (100.0 - pct) * (now - samples[0][0]) / (pct - samples[0][1])
+            eta = f" · 남은 시간 약 {int(remain // 60)}분 {int(remain % 60):02d}초" if remain >= 60 else f" · 남은 시간 약 {int(remain)}초"
+        self.status_var.set(f"[{pct:5.1f}%] {status_msg}{eta}")
 
     def browse_folder(self):
         selected = filedialog.askdirectory(initialdir=self.target_dir.get())
@@ -2362,7 +2523,7 @@ class AutoCutStudioApp(tk.Tk):
 
         ttk.Button(btn_row, text="닫기", command=dlg.destroy).pack(side=tk.RIGHT)
 
-    def start_auto_edit(self):
+    def start_auto_edit(self, preview: bool = False):
         sel = self.date_listbox.curselection()
         if not sel:
             messagebox.showinfo("날짜 선택", "왼쪽 목록에서 자동 편집할 날짜 폴더를 선택해주세요.")
@@ -2373,16 +2534,18 @@ class AutoCutStudioApp(tk.Tk):
         self._stop_requested = False
         self._running = True
         self.start_btn.configure(state=tk.DISABLED)
+        self.preview_btn.configure(state=tk.DISABLED)
         self.stop_btn.configure(state=tk.NORMAL)
         self.progress_var.set(0.0)
+        self._eta_samples = []
 
         threading.Thread(
             target=self._worker_run,
-            args=(selected_paths, folder_modes),
+            args=(selected_paths, folder_modes, preview),
             daemon=True,
         ).start()
 
-    def _worker_run(self, selected_paths, folder_modes=None):
+    def _worker_run(self, selected_paths, folder_modes=None, preview=False):
         base_dir = self.target_dir.get().strip()
         chosen_preset = self.style_preset_var.get()
         chosen_intro_style = INTRO_STYLE_PRESETS.get(self.intro_style_var.get(), "classic_frame")
@@ -2446,6 +2609,7 @@ class AutoCutStudioApp(tk.Tk):
                     intro_typewriter=self.intro_typewriter.get(),
                     lower_third_captions=self.lower_third_captions.get(),
                     end_credits=self.end_credits.get(),
+                    preview=preview,
                     log_fn=lambda m: self.after(0, self.log, m),
                     progress_fn=lambda p, s: self.after(0, self.update_progress, p, s),
                     stop_check_fn=lambda: self._stop_requested,
@@ -2475,6 +2639,7 @@ class AutoCutStudioApp(tk.Tk):
         finally:
             self._running = False
             self.after(0, lambda: self.start_btn.configure(state=tk.NORMAL))
+            self.after(0, lambda: self.preview_btn.configure(state=tk.NORMAL))
             self.after(0, lambda: self.stop_btn.configure(state=tk.DISABLED))
 
 

@@ -130,6 +130,7 @@ class TimelinePanel(tk.Frame):
         self.GAP = self._px(5)
         self.CANVAS_H = self._px(94)
         self.log_fn = log_fn
+        self.on_edit_cuts: Optional[Callable[[Dict], None]] = None  # set by the app: opens the cut editor for an item
         self.bg = bg
         self.ff = font_family
         self.folder = ""
@@ -768,6 +769,8 @@ class TimelinePanel(tk.Frame):
         what = "선택한 클립" if n == 1 else f"선택한 {n}개"
         m = tk.Menu(self, tearoff=0, font=(self.ff, 10))
         m.add_command(label=f"▶ 재생 / 열기: {it['file']}", command=lambda: self._on_double(e))
+        if self.on_edit_cuts and it.get("type") == "video":
+            m.add_command(label="✂ AI가 고른 구간 보기 / 수정...", command=lambda: self.on_edit_cuts(it))
         m.add_separator()
         m.add_command(label=f"⏮ {what} 맨 앞으로 이동", command=lambda: self._move_block(0))
         m.add_command(label=f"⏭ {what} 맨 뒤로 이동", command=lambda: self._move_block(len(self.items)))

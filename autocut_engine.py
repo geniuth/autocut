@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "3.5.0"
+AUTOCUT_VERSION = "3.6.0"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -4910,6 +4910,77 @@ def _speech_overlap(clip: Dict, s: float, e: float) -> Tuple[float, Optional[Tup
     return total, ((lo, hi) if lo is not None else None)
 
 
+# ── Manual cut edits ─────────────────────────────────────────────────────────
+# The intervals the user set for a clip in the cut editor: {file name: [[start, end], ...]} ([] = leave the clip
+# out). They replace what the AI picked for that clip after the length cap, so they are rendered exactly as set.
+
+MIN_CUT_SEC = 0.8
+
+
+def cut_edit_path(output_dir: str, date_name: str) -> str:
+    return os.path.join(output_dir, f"{date_name}_컷수정.json")
+
+
+def load_cut_overrides(output_dir: str, date_name: str) -> Dict[str, List[List[float]]]:
+    data = _load_json_cache(cut_edit_path(output_dir, date_name)).get("clips") or {}
+    return {str(k): [[float(a), float(b)] for a, b in v] for k, v in data.items() if isinstance(v, list)}
+
+
+def save_cut_overrides(output_dir: str, date_name: str, overrides: Dict[str, List[List[float]]]) -> None:
+    fp = cut_edit_path(output_dir, date_name)
+    if not overrides:
+        if os.path.exists(fp):
+            os.remove(fp)
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    with open(fp, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "clips": overrides}, f, ensure_ascii=False, indent=1)
+
+
+def normalize_cut_intervals(intervals: List[List[float]], duration: float) -> List[List[float]]:
+    """Clamp to the clip, drop pieces under MIN_CUT_SEC, sort and merge overlaps."""
+    out: List[List[float]] = []
+    for a, b in sorted((max(0.0, float(a)), min(float(duration), float(b))) for a, b in intervals):
+        if b - a < MIN_CUT_SEC:
+            continue
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([round(a, 2), round(b, 2)])
+    return out
+
+
+def apply_cut_overrides(clips_meta: List[Dict], overrides: Dict[str, List[List[float]]]) -> int:
+    n = 0
+    for c in clips_meta:
+        if c.get("type", "video") != "video" or c.get("file") not in overrides:
+            continue
+        c["kept_intervals"] = normalize_cut_intervals(overrides[c["file"]], float(c.get("duration", 0.0) or 0.0))
+        c["kept_duration"] = round(sum(e - s for s, e in c["kept_intervals"]), 2)
+        n += 1
+    return n
+
+
+def planned_cuts_for_folder(output_dir: str, date_name: str, max_ratio: float) -> Dict[str, Dict]:
+    """
+    For the cut editor: {file: {"auto": intervals after the length cap, "duration", "speech"}} from the saved
+    analysis report ({} when the folder has not been analysed yet).
+    """
+    import copy
+
+    rep = _load_json_cache(os.path.join(output_dir, f"{date_name}_편집분석리포트.json"))
+    clips = copy.deepcopy(rep.get("clips") or [])
+    if not clips:
+        return {}
+    enforce_edit_length_budget(clips, max_ratio, log_fn=lambda _m: None)
+    return {
+        c["file"]: {"auto": [list(iv) for iv in c.get("kept_intervals", [])], "duration": float(c.get("duration", 0.0) or 0.0),
+                    "speech": c.get("speech") or []}
+        for c in clips
+        if c.get("type", "video") == "video"
+    }
+
+
 def enforce_edit_length_budget(
     clips_meta: List[Dict], max_ratio: float, log_fn: Callable[[str], None] = print
 ) -> Tuple[float, float]:
@@ -5075,6 +5146,7 @@ def run_autocut_pipeline(
     lower_third_captions: bool = False,
     end_credits: bool = False,
     bgm_speech_ducking: bool = True,
+    preview: bool = False,
     log_fn: Callable[[str], None] = print,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     stop_check_fn: Optional[Callable[[], bool]] = None,
@@ -5098,6 +5170,8 @@ def run_autocut_pipeline(
     end_credits: a rolling credits segment (title, date, cameras, clip counts, logo) after the last cut.
     bgm_speech_ducking: BGM stays at bgm_video_vol under speech and rises (x2.5, max 20%) in pauses.
     custom_bgm_path: an audio file, or a folder of tracks played in name order as one playlist.
+    preview: quick look at the whole edit — 1280x720 30 fps at 4 Mbps into "<date>_미리보기.mp4" (own resume
+        cache, no subtitle burn-in / vertical version); the cuts, order, transitions and sound are the real ones.
     Models:
       1) Faster-Whisper large-v3-turbo (Speech & VAD)
       2) CLIP Aesthetic Predictor (SigLIP / LAION-Aesthetics V2.5)
@@ -5111,6 +5185,13 @@ def run_autocut_pipeline(
     if edit_mode == "normal":
         edit_mode = "travel"
 
+    if preview:
+        scale = 720.0 / max(1, min(int(out_width), int(out_height)))
+        if scale < 1.0:
+            out_width, out_height = int(round(out_width * scale / 2)) * 2, int(round(out_height * scale / 2)) * 2
+        out_fps = min(float(out_fps), 30.0)
+        video_bitrate_bps = min(int(video_bitrate_bps), 4_000_000)
+        burn_subtitles = vertical_reframe = False
     out_width = max(320, int(out_width))
     out_height = max(240, int(out_height))
     out_fps = float(out_fps)
@@ -5410,6 +5491,10 @@ def run_autocut_pipeline(
         # Length cap (on in-memory intervals only: the saved analysis report keeps the full selection,
         # so changing the cap later re-trims from the original analysis instead of from a trimmed one)
         _, kept_video_sec = enforce_edit_length_budget(clips_meta, max_edit_ratio, log_fn=log_fn)
+        n_manual = apply_cut_overrides(clips_meta, load_cut_overrides(output_dir, date_name))
+        if n_manual:
+            kept_video_sec = sum(c.get("kept_duration", 0.0) for c in clips_meta if c.get("type", "video") == "video")
+            log_fn(f"✂️ 컷 수정 적용: {n_manual}개 클립은 직접 정한 구간으로 편집합니다 ({os.path.basename(cut_edit_path(output_dir, date_name))})")
         n_photo_cuts = sum(1 for c in clips_meta if c.get("type") == "photo")
         total_edit_sec = kept_video_sec + 3.0 * n_photo_cuts
         analysis_summary["total_edited_seconds"] = round(total_edit_sec, 2)
@@ -5437,7 +5522,7 @@ def run_autocut_pipeline(
         seg_files = []
         # Finished cuts are kept next to the results until the edit completes, so a run that was stopped,
         # crashed or hung continues from the first cut that is missing or whose settings changed
-        resume_dir = os.path.join(output_dir, RESUME_DIR_NAME)
+        resume_dir = os.path.join(output_dir, RESUME_DIR_NAME + ("_미리보기" if preview else ""))
         os.makedirs(resume_dir, exist_ok=True)
         manifest_path = os.path.join(resume_dir, "manifest.json")
         manifest = _load_json_cache(manifest_path)
@@ -5992,7 +6077,7 @@ def run_autocut_pipeline(
             for sf in seg_files:
                 f.write("file '" + sf.replace(chr(92), "/").replace("'", "'\\''") + "'\n")
 
-        clean_mp4 = os.path.join(output_dir, f"{date_name}_무자막_필모라용.mp4")
+        clean_mp4 = os.path.join(output_dir, f"{date_name}_미리보기.mp4" if preview else f"{date_name}_무자막_필모라용.mp4")
         subbed_mp4 = os.path.join(output_dir, f"{date_name}_자막포함_완성본.mp4")
 
         if progress_fn:
@@ -6012,7 +6097,11 @@ def run_autocut_pipeline(
         if rc != 0:
             raise RuntimeError(f"클립 병합 실패: {' / '.join(err_txt.strip().splitlines()[-3:])}")
         os.replace(clean_part, clean_mp4)
-        log_fn(f"✅ 필모라 연동용 무자막 영상 저장 완료: {clean_mp4}")
+        log_fn(
+            f"✅ 미리보기 영상 저장 완료 ({out_width}x{out_height} {out_fps:g}fps): {clean_mp4}"
+            if preview
+            else f"✅ 필모라 연동용 무자막 영상 저장 완료: {clean_mp4}"
+        )
 
         # Final check of the finished file (timestamps only, a few seconds): the two failures seen in practice —
         # a stretch without video and silently dropped frames — were only found by watching the result
@@ -6131,7 +6220,8 @@ def run_autocut_pipeline(
         analysis_summary["output_dir"] = output_dir
         analysis_summary["output_dynamic_range"] = out_dr
         analysis_summary["subbed_mp4"] = subbed_mp4 if burn_subtitles else ""
-        analysis_summary["clean_mp4"] = clean_mp4 if export_filmora_clean else ""
+        analysis_summary["clean_mp4"] = clean_mp4 if (export_filmora_clean or preview) else ""
+        analysis_summary["preview"] = preview
         analysis_summary["srt_full"] = srt_full
         analysis_summary["srt_speech"] = srt_speech
         analysis_summary["srt_speaker"] = srt_speaker if (n_speakers >= 2 and os.path.exists(srt_speaker)) else ""
