@@ -161,7 +161,7 @@ try:
 except Exception:
     pass
 
-AUTOCUT_VERSION = "3.2.0"
+AUTOCUT_VERSION = "3.3.0"
 __version__ = AUTOCUT_VERSION
 
 DEFAULT_AI_MODELS: Dict[str, str] = {
@@ -909,6 +909,12 @@ def _libplacebo_decode_args() -> List[str]:
     """Decoder for graphs that use libplacebo: NVDEC when an NVIDIA GPU is present (tested correct with the
     Vulkan device), otherwise software. Never '-hwaccel auto', which yields solid-blue 10-bit frames here."""
     return ["-hwaccel", "cuda"] if shutil.which("nvidia-smi") else []
+
+
+def _default_decode_args() -> List[str]:
+    """Decoder for ordinary cuts: NVDEC when an NVIDIA GPU is present (measured 15-18% faster than '-hwaccel auto'
+    on 4K sources with identical frames; ffmpeg falls back to software for formats NVDEC cannot decode)."""
+    return ["-hwaccel", "cuda"] if shutil.which("nvidia-smi") else ["-hwaccel", "auto"]
 
 
 def sdr_to_output_vf(output_dr: str = "sdr") -> Tuple[List[str], str]:
@@ -4431,6 +4437,21 @@ def verify_output_video(path: str, expected_sec: float, out_fps: float) -> Dict:
     return res
 
 
+def _ass_event_spans(ass_path: str) -> List[Tuple[float, float]]:
+    """(start, end) seconds of every Dialogue event in an ASS file."""
+    spans = []
+    try:
+        with open(ass_path, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                m = re.match(r"Dialogue:\s*[^,]*,(\d+):(\d+):(\d+(?:\.\d+)?),(\d+):(\d+):(\d+(?:\.\d+)?),", line)
+                if m:
+                    g = [float(x) for x in m.groups()]
+                    spans.append((g[0] * 3600 + g[1] * 60 + g[2], g[3] * 3600 + g[4] * 60 + g[5]))
+    except OSError:
+        pass
+    return spans
+
+
 def _video_packet_count(path: str) -> int:
     """Number of video packets in a file (container scan, no decoding); 0 when there is no video stream."""
     try:
@@ -5387,7 +5408,7 @@ def run_autocut_pipeline(
             next_td = 0.0 if is_last_cut else plans[cut_idx][1]
 
             hdr_hw_args: List[str] = []
-            decode_args: List[str] = ["-hwaccel", "auto"]
+            decode_args: List[str] = _default_decode_args()
             hdr_head = ""
             # tail_vf finishes the graph in the master's format: 8-bit SDR, or for an HLG master the
             # SDR -> HLG conversion (SDR sources) / just 10-bit (HDR sources, already HLG at that point)
@@ -5717,15 +5738,50 @@ def run_autocut_pipeline(
             if progress_fn:
                 progress_fn(94.0, "자막 하드코딩 완성본 MP4 렌더링 중...")
             log_fn(f"🎬 자막 입힌 완성형 MP4 렌더링 중 ({codec_label}, {video_bitrate_bps:,} bps)...")
+            # Only the cuts that show a subtitle are encoded again (shifted onto the edit's timeline for the ass
+            # filter and back); cuts without one are copied as they are. The old way re-encoded the whole edit.
+            spans = _ass_event_spans(ass_tmp)
+            seg_durs = ([intro_dur] if enable_intro else []) + [round(ce - cs, 2) for _c, cs, ce in flat_cuts]
+            sub_list, t_cursor, n_burned = [], 0.0, 0
+            for seg_i, (seg, seg_d) in enumerate(zip(seg_files, seg_durs)):
+                if any(a < t_cursor + seg_d and b > t_cursor for a, b in spans):
+                    if progress_fn:
+                        progress_fn(94.0 + 5.0 * seg_i / max(1, len(seg_files)), f"자막 입히는 중 ({seg_i + 1}/{len(seg_files)})...")
+                    sub_seg = os.path.join(tmpdir, f"sub_{seg_i:04d}.mp4")
+                    rc, err_txt = _run_ffmpeg_retry_stall(
+                        ["ffmpeg", "-y", "-v", "error", *_default_decode_args(), "-i", seg,
+                         "-vf", f"setpts=PTS+{t_cursor:.3f}/TB,ass=subtitles.ass,setpts=PTS-{t_cursor:.3f}/TB",
+                         *vcodec_args, "-c:a", "copy", sub_seg],
+                        (sub_seg,), stop_check_fn, cwd=tmpdir, log_fn=log_fn, what="자막 입히기",
+                    )
+                    if rc != 0:
+                        raise RuntimeError(f"자막 입히기 실패: {' / '.join(err_txt.strip().splitlines()[-3:])}")
+                    sub_list.append(sub_seg)
+                    n_burned += 1
+                else:
+                    sub_list.append(seg)
+                t_cursor += seg_d
+            sub_txt = os.path.join(tmpdir, "concat_subbed.txt")
+            with open(sub_txt, "w", encoding="utf-8") as f:
+                for sf in sub_list:
+                    f.write("file '" + sf.replace(chr(92), "/").replace("'", "'\\''") + "'\n")
             rc, err_txt = _run_ffmpeg_retry_stall(
-                ["ffmpeg", "-y", "-v", "error", "-hwaccel", "auto", "-i", clean_mp4, "-vf", "ass=subtitles.ass", *vcodec_args,
-                 "-c:a", "copy", "-movflags", "+faststart", subbed_part],
-                (subbed_part,), stop_check_fn, cwd=tmpdir, log_fn=log_fn, what="자막 입히기",
+                ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", sub_txt, "-c", "copy", *tag_args,
+                 "-movflags", "+faststart", subbed_part],
+                (subbed_part,), stop_check_fn, log_fn=log_fn, what="자막본 병합",
             )
             if rc != 0:
-                raise RuntimeError(f"자막 입히기 실패: {' / '.join(err_txt.strip().splitlines()[-3:])}")
+                raise RuntimeError(f"자막본 병합 실패: {' / '.join(err_txt.strip().splitlines()[-3:])}")
             os.replace(subbed_part, subbed_mp4)
-            log_fn(f"✅ 자막 포함 완성본 영상 저장 완료: {subbed_mp4}")
+            log_fn(
+                f"✅ 자막 포함 완성본 영상 저장 완료: {subbed_mp4} "
+                f"(자막이 나오는 컷 {n_burned}개만 다시 인코딩, 나머지 {len(sub_list) - n_burned}개는 그대로 복사)"
+            )
+            sub_check = verify_output_video(subbed_mp4, expected_total, out_fps)
+            if not sub_check["ok"]:
+                log_fn("⚠️ 자막 포함 완성본 검사에서 문제를 찾았습니다:")
+                for prob in sub_check["problems"]:
+                    log_fn(f"   • {prob}")
 
         vertical_mp4 = os.path.join(output_dir, f"{date_name}_세로쇼츠_9x16.mp4")
         made_vertical = False
